@@ -1,0 +1,10 @@
+node_modules/
+.env
+*.log
+.DS_Store
+dist/
+build/
+.mcsync/
+devices.enc
+store.key
+config.json
