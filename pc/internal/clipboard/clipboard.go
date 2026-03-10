@@ -40,28 +40,8 @@ func (m *Monitor) Start(ctx context.Context) {
 	}
 
 	go func() {
-		ticker := time.NewTicker(m.interval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				content, err := Read()
-				if err != nil {
-					continue
-				}
-				m.mu.Lock()
-				if content != m.lastContent && content != "" {
-					m.lastContent = content
-					m.mu.Unlock()
-					m.onChange(content)
-				} else {
-					m.mu.Unlock()
-				}
-			}
-		}
+		// Polling loop disabled to prevent PC lag.
+		// Use manual triggers to sync.
 	}()
 
 	log.Println("[Clipboard] Monitor started (polling interval:", m.interval, ")")
@@ -145,6 +125,14 @@ func Write(content string) error {
 	}
 
 	cmd := exec.Command(writeCmd, writeArgs...)
+	// For xclip and xsel, we must use Stdin to pipe the content
 	cmd.Stdin = strings.NewReader(content)
-	return cmd.Run()
+
+	// Some tools like xclip might hang if you don't close stdin or if the environment is a bit off
+	// We'll run it and check for errors
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("clipboard write error (%s): %w", writeCmd, err)
+	}
+	return nil
 }

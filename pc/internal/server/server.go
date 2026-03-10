@@ -272,6 +272,9 @@ func (s *Server) handleClient(client *Client, remoteAddr string) {
 			s.handleFileChunk(client, msg)
 		case protocol.TypeFileEnd:
 			s.handleFileEnd(client, msg)
+		case protocol.TypePing:
+			resp, _ := protocol.NewMessage(protocol.TypePong, nil)
+			s.sendMessage(client, resp)
 		case protocol.TypePong:
 			// keepalive response, no action needed
 		default:

@@ -5,9 +5,9 @@ const fs = require("fs-extra");
 const AppName = "mcsync";
 const DefaultPort = 9090;
 const ServiceType = "_mcsync._tcp";
-const ChunkSize = 64 * 1024; // 64KB
+const ChunkSize = 60 * 1024; // 60KB (multiple of 3 for base64 safety)
 const PingInterval = 15; // seconds
-const MaxMessageSize = 1024 * 1024; // 1MB
+const MaxMessageSize = 10 * 1024 * 1024; // 10MB (raised for better handling)
 
 class Config {
   constructor() {

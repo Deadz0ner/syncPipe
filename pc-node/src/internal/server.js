@@ -153,6 +153,9 @@ class Server {
       case MessageTypes.FILE_END:
         await this.handleFileEnd(client, msg);
         break;
+      case MessageTypes.PING:
+        this.sendMessage(client, new Message(MessageTypes.PONG));
+        break;
       case MessageTypes.PONG:
         break;
       default:
@@ -243,6 +246,7 @@ class Server {
   handleText(client, msg) {
     if (!client.authed) return;
     console.log(`[Text] From ${client.deviceName}: ${msg.data.content}`);
+    this.emit("text", msg.data.content);
     this.sendMessage(
       client,
       new Message(MessageTypes.ACK, { message_id: msg.id, status: "ok" }),
@@ -285,11 +289,17 @@ class Server {
     if (!client.authed) return;
     const { transfer_id, data } = msg.data;
     const transfer = this.transfers.get(transfer_id);
-    if (transfer) {
-      const buffer = Buffer.from(data, "base64");
-      transfer.stream.write(buffer);
-      transfer.hash.update(buffer);
-      transfer.received++;
+    if (!transfer) return;
+
+    const buffer = Buffer.from(data, "base64");
+    transfer.hash.update(buffer);
+    transfer.received++;
+
+    // Await backpressure: if write() returns false, wait for 'drain' before continuing.
+    // This prevents out-of-order writes and buffer overflow on large files.
+    const canContinue = transfer.stream.write(buffer);
+    if (!canContinue) {
+      await new Promise((resolve) => transfer.stream.once("drain", resolve));
     }
   }
 
@@ -298,7 +308,14 @@ class Server {
     const { transfer_id, checksum } = msg.data;
     const transfer = this.transfers.get(transfer_id);
     if (transfer) {
-      transfer.stream.end();
+      // Wait for the write stream to fully flush before reporting done
+      await new Promise((resolve, reject) => {
+        transfer.stream.end((err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+
       const actualChecksum = transfer.hash.digest("hex");
 
       if (checksum && checksum !== actualChecksum) {
@@ -368,7 +385,7 @@ class Server {
 
     const stats = await fs.stat(filePath);
     const transferID = Store.generateDeviceID();
-    const chunkSize = 64 * 1024;
+    const chunkSize = 60 * 1024; // 60KB (multiple of 3)
 
     this.sendMessage(
       client,
@@ -434,10 +451,12 @@ class Server {
 
   on(event, callback) {
     if (event === "clipboard") this._onClipboard = callback;
+    if (event === "text") this._onText = callback;
   }
 
   emit(event, ...args) {
     if (event === "clipboard" && this._onClipboard) this._onClipboard(...args);
+    if (event === "text" && this._onText) this._onText(...args);
   }
 }
 

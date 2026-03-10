@@ -10,25 +10,8 @@ class ClipboardMonitor extends EventEmitter {
   }
 
   async start() {
-    try {
-      this.lastContent = await clipboardy.read();
-    } catch (err) {
-      // Ignore initial read errors
-    }
-
-    this.timer = setInterval(async () => {
-      try {
-        const content = await clipboardy.read();
-        if (content && content !== this.lastContent) {
-          this.lastContent = content;
-          this.emit("change", content);
-        }
-      } catch (err) {}
-    }, this.interval);
-
-    console.log(
-      `[Clipboard] Monitor started (polling interval: ${this.interval}ms)`,
-    );
+    // Polling disabled to prevent system lag. Clipboard sync is now on-demand.
+    console.log(`[Clipboard] Monitor available (On-Demand Mode)`);
   }
 
   stop() {
@@ -46,7 +29,11 @@ class ClipboardMonitor extends EventEmitter {
   async write(content) {
     try {
       this.setContent(content);
-      await clipboardy.write(content);
+      const writeFn = clipboardy.write || clipboardy.default?.write;
+      if (typeof writeFn !== "function") {
+        throw new Error("clipboardy.write is not available");
+      }
+      await writeFn(content);
     } catch (err) {
       console.error(`[Clipboard] Failed to write: ${err.message}`);
     }
@@ -54,7 +41,11 @@ class ClipboardMonitor extends EventEmitter {
 
   async read() {
     try {
-      return await clipboardy.read();
+      const readFn = clipboardy.read || clipboardy.default?.read;
+      if (typeof readFn !== "function") {
+        return "";
+      }
+      return await readFn();
     } catch (err) {
       return "";
     }
