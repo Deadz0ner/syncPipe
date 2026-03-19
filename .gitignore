@@ -1,0 +1,13 @@
+mobile/node_modules/
+mobile/.expo/
+mobile/.expo-shared/
+mobile/.vscode/
+mobile/.env
+mobile/.env.local
+mobile/.env.development
+mobile/.env.production
+mobile/.env.staging
+
+pc-node/node_modules/
+pc-node/.vscode/
+pc-node/.env
