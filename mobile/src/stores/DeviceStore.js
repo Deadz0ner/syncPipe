@@ -4,6 +4,7 @@
  */
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Platform } from "react-native";
 
 const KEYS = {
   DEVICE_ID: "@mcsync_device_id",
@@ -17,7 +18,7 @@ const KEYS = {
 
 class DeviceStore {
   constructor() {
-    this._cache = {};
+    // No cache used
   }
 
   /**
@@ -33,12 +34,14 @@ class DeviceStore {
   }
 
   /**
-   * Get or set the device name
+   * Get or set the device name (platform-aware)
    */
   async getDeviceName() {
     let name = await AsyncStorage.getItem(KEYS.DEVICE_NAME);
     if (!name) {
-      name = `Android-${Math.random().toString(36).substr(2, 4)}`;
+      const platform = Platform.OS === 'ios' ? 'iPhone' : 'Android';
+      const suffix = Math.random().toString(36).substr(2, 4).toUpperCase();
+      name = `${platform}-${suffix}`;
       await AsyncStorage.setItem(KEYS.DEVICE_NAME, name);
     }
     return name;
@@ -92,6 +95,11 @@ class DeviceStore {
     const servers = await this.getPairedServers();
     const filtered = servers.filter((s) => s.serverId !== serverId);
     await AsyncStorage.setItem(KEYS.PAIRED_SERVERS, JSON.stringify(filtered));
+
+    const lastServer = await this.getLastServer();
+    if (lastServer && lastServer.serverId === serverId) {
+      await AsyncStorage.removeItem(KEYS.LAST_SERVER);
+    }
   }
 
   /**
@@ -147,12 +155,11 @@ class DeviceStore {
   }
 
   _generateId() {
-    const chars = "abcdef0123456789";
-    let id = "";
-    for (let i = 0; i < 32; i++) {
-      id += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return id;
+    // Generate a device ID combining timestamp and random component
+    // Not cryptographically secure but sufficient for device pairing
+    const timestamp = Date.now().toString(36);
+    const randomPart = Math.random().toString(36).substr(2, 16);
+    return `${timestamp}-${randomPart}`;
   }
 }
 

@@ -15,6 +15,7 @@ import {
   TextInput,
   Platform,
 } from "react-native";
+import Constants from "expo-constants";
 import * as FS from "expo-file-system/legacy";
 import deviceStore from "../stores/DeviceStore";
 import wsService from "../services/WebSocketService";
@@ -290,7 +291,9 @@ const SettingsScreen = ({ navigation }) => {
 
         {/* Version */}
         <View style={styles.versionContainer}>
-          <Text style={styles.versionText}>mcSync Mobile v1.0.0</Text>
+          <Text style={styles.versionText}>
+            mcSync v{Constants.expoConfig?.version || '1.0.0'}
+          </Text>
         </View>
       </ScrollView>
     </View>

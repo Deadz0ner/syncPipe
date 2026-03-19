@@ -9,8 +9,7 @@ class ClipboardService {
   constructor() {
     this.lastContent = "";
     this.monitoring = false;
-    this._interval = null;
-    this._ignoreNext = false;
+    this._unsubscribe = null;
   }
 
   /**
@@ -20,11 +19,9 @@ class ClipboardService {
     if (this.monitoring) return;
     this.monitoring = true;
 
-    // We no longer automatically poll/sync out every second.
-    // Listen for clipboard from PC
-    wsService.on("clipboard", async (data) => {
+    // Listen for clipboard updates from PC
+    this._unsubscribe = wsService.on("clipboard", async (data) => {
       if (data && data.content) {
-        this._ignoreNext = true; // Prevent echo
         this.lastContent = data.content;
         await Clipboard.setStringAsync(data.content);
         console.log(
@@ -37,12 +34,12 @@ class ClipboardService {
   }
 
   /**
-   * Stop monitoring
+   * Stop monitoring and cleanup
    */
   stop() {
-    if (this._interval) {
-      clearInterval(this._interval);
-      this._interval = null;
+    if (this._unsubscribe) {
+      this._unsubscribe();
+      this._unsubscribe = null;
     }
     this.monitoring = false;
     console.log("[Clipboard] Monitoring stopped");

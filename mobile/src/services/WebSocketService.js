@@ -7,10 +7,12 @@ class WebSocketService {
   constructor() {
     this.ws = null;
     this.url = null;
+    this.status = "disconnected";
+    this.statusDetail = "";
     this.isConnected = false;
     this.isAuthenticated = false;
     this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 50;
+    this.maxReconnectAttempts = 10;
     this.reconnectDelay = 1000; // Start at 1s, exponential backoff
     this.messageHandlers = new Map();
     this.pendingMessages = [];
@@ -18,20 +20,31 @@ class WebSocketService {
     this.authInfo = null;
     this._reconnectTimer = null;
     this._pingTimer = null;
-    this._onStatusChange = null;
+    this._statusListeners = new Set();
+    this._manualDisconnect = false;
   }
 
   /**
    * Set callback for connection status changes
    */
   onStatusChange(callback) {
-    this._onStatusChange = callback;
+    this._statusListeners.add(callback);
+    callback(this.status, this.statusDetail);
+    return () => {
+      this._statusListeners.delete(callback);
+    };
   }
 
   _notifyStatus(status, detail = "") {
-    if (this._onStatusChange) {
-      this._onStatusChange(status, detail);
-    }
+    this.status = status;
+    this.statusDetail = detail;
+    this._statusListeners.forEach((listener) => {
+      try {
+        listener(status, detail);
+      } catch (e) {
+        console.log(`[WS] Status listener error: ${e.message}`);
+      }
+    });
   }
 
   /**
@@ -41,20 +54,36 @@ class WebSocketService {
    * @param {object} authInfo - { deviceId, authToken, deviceName }
    */
   connect(host, port, authInfo = null) {
+    this._manualDisconnect = false;
+    this.connectionInfo = { host, port };
     this.url = `ws://${host}:${port}/ws`;
     this.authInfo = authInfo;
     this.reconnectAttempts = 0;
+    this._clearReconnectTimer();
     this._doConnect();
   }
 
-  _doConnect() {
-    if (this.ws) {
-      this.ws.onopen = null;
-      this.ws.onmessage = null;
-      this.ws.onerror = null;
-      this.ws.onclose = null;
-      this.ws.close();
+  reconnect() {
+    if (!this.connectionInfo || !this.connectionInfo.host || !this.connectionInfo.port) {
+      this._notifyStatus("failed", "No previous server available");
+      return false;
     }
+
+    this._manualDisconnect = false;
+    this.reconnectAttempts = 0;
+    this._clearReconnectTimer();
+    this._teardownSocket();
+    this._doConnect();
+    return true;
+  }
+
+  _doConnect() {
+    if (!this.url) {
+      this._notifyStatus("failed", "Missing connection URL");
+      return;
+    }
+
+    this._teardownSocket();
 
     this._notifyStatus("connecting", this.url);
     console.log(`[WS] Connecting to ${this.url}...`);
@@ -147,14 +176,13 @@ class WebSocketService {
 
     this.ws.onclose = (event) => {
       console.log(`[WS] Disconnected (code: ${event.code})`);
-      const wasConnected = this.isConnected;
+      this.ws = null;
       this.isConnected = false;
       this.isAuthenticated = false;
       this._stopPing();
       this._notifyStatus("disconnected");
 
-      // Only schedule reconnect if we didn't explicitly disconnect
-      if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      if (!this._manualDisconnect && this.connectionInfo) {
         this._scheduleReconnect();
       }
     };
@@ -304,6 +332,11 @@ class WebSocketService {
       }
     } catch (e) {
       clearTimeout(timeoutId);
+      if (e.message === "Network request failed") {
+        console.log(
+          `[WS] Cleartext/local network request blocked for http://${host}:${port}/info`,
+        );
+      }
     }
     return null;
   }
@@ -336,6 +369,11 @@ class WebSocketService {
       if (e.name === "AbortError") {
         throw new Error(
           "Connection timed out. Ensure IP is correct and PC is running mcSync.",
+        );
+      }
+      if (e.message === "Network request failed") {
+        throw new Error(
+          "Could not reach the PC over local network. Check the IP/port, confirm both devices are on the same network, and if you are using the APK build install the latest build with cleartext local traffic enabled.",
         );
       }
       throw e;
@@ -458,16 +496,11 @@ class WebSocketService {
    * Disconnect and cleanup
    */
   disconnect() {
+    this._manualDisconnect = true;
     this.reconnectAttempts = this.maxReconnectAttempts; // Prevent auto-reconnect
     this._stopPing();
-    if (this._reconnectTimer) {
-      clearTimeout(this._reconnectTimer);
-      this._reconnectTimer = null;
-    }
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
+    this._clearReconnectTimer();
+    this._teardownSocket();
     this.isConnected = false;
     this.isAuthenticated = false;
     this._notifyStatus("disconnected");
@@ -513,6 +546,10 @@ class WebSocketService {
   }
 
   _scheduleReconnect() {
+    if (this._manualDisconnect || !this.connectionInfo) {
+      return;
+    }
+
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.log("[WS] Max reconnect attempts reached");
       this._notifyStatus("failed", "Max reconnect attempts reached");
@@ -531,6 +568,7 @@ class WebSocketService {
     );
     this._notifyStatus("reconnecting", `Attempt ${this.reconnectAttempts}`);
 
+    this._clearReconnectTimer();
     this._reconnectTimer = setTimeout(() => {
       this._doConnect();
     }, delay);
@@ -550,6 +588,32 @@ class WebSocketService {
       clearInterval(this._pingTimer);
       this._pingTimer = null;
     }
+  }
+
+  _clearReconnectTimer() {
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+  }
+
+  _teardownSocket(shouldClose = true) {
+    if (!this.ws) return;
+
+    this.ws.onopen = null;
+    this.ws.onmessage = null;
+    this.ws.onerror = null;
+    this.ws.onclose = null;
+
+    if (shouldClose) {
+      try {
+        this.ws.close();
+      } catch (e) {
+        console.log(`[WS] Socket close error: ${e.message}`);
+      }
+    }
+
+    this.ws = null;
   }
 }
 

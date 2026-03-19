@@ -46,7 +46,7 @@ const FileTransferScreen = ({ navigation }) => {
     });
 
     // Track connection status
-    wsService.onStatusChange((status) => {
+    const unsubStatus = wsService.onStatusChange((status) => {
       setIsConnected(status === "authenticated");
     });
 
@@ -66,6 +66,7 @@ const FileTransferScreen = ({ navigation }) => {
     loadReceiveDir();
 
     return () => {
+      unsubStatus();
       fileTransferService.setOnProgress(null);
       fileTransferService.setOnFileReceived(null);
     };

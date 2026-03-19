@@ -11,6 +11,7 @@ import {NavigationContainer} from '@react-navigation/native';
 import {createNativeStackNavigator} from '@react-navigation/native-stack';
 import {SafeAreaProvider} from 'react-native-safe-area-context';
 
+import ErrorBoundary from './src/components/ErrorBoundary';
 import HomeScreen from './src/screens/HomeScreen';
 import PairScreen from './src/screens/PairScreen';
 import FileTransferScreen from './src/screens/FileTransferScreen';
@@ -24,9 +25,10 @@ const Stack = createNativeStackNavigator();
 
 function App() {
   return (
-    <SafeAreaProvider>
-      <StatusBar barStyle="light-content" backgroundColor="#0D1117" />
-      <NavigationContainer
+    <ErrorBoundary>
+      <SafeAreaProvider>
+        <StatusBar barStyle="light-content" backgroundColor="#0D1117" />
+        <NavigationContainer
         theme={{
           dark: true,
           fonts: {
@@ -57,7 +59,8 @@ function App() {
           <Stack.Screen name="Settings" component={SettingsScreen} />
         </Stack.Navigator>
       </NavigationContainer>
-    </SafeAreaProvider>
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
 

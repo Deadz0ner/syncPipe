@@ -69,6 +69,11 @@ class FileTransferService {
   /**
    * One-time storage permission check at startup.
    * Resolves the receive directory so file transfers don't block on permission dialogs.
+   *
+   * NOTE: WRITE_EXTERNAL_STORAGE is deprecated on Android 10+ (API 29+).
+   * For Android 11+, the SAF (Storage Access Framework) should be used instead.
+   * Current implementation may not work on Android 13+ without MANAGE_EXTERNAL_STORAGE.
+   * This is a known limitation that requires SAF refactoring (see GitHub issues).
    */
   async _initStoragePermission() {
     try {
@@ -501,6 +506,11 @@ class FileTransferService {
     }
   }
 
+  /**
+   * DEPRECATED: Legacy JSON-based chunk handler. Modern protocol uses binary frames via _handleBinary.
+   * Kept for backwards compatibility but not called in current flow.
+   * @private
+   */
   _handleFileChunk(data) {
     const transfer = this.activeReceives.get(data.transfer_id);
     if (!transfer) return;
@@ -620,6 +630,13 @@ class FileTransferService {
     }
   }
 
+  /**
+   * Convert ArrayBuffer to Base64 string.
+   * Uses string concatenation which is O(n) in this case since JS engines
+   * optimize += for strings. For very large files (>100MB), consider using
+   * Array.from + join for better performance on some engines.
+   * @private
+   */
   _arrayBufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
     let binary = "";

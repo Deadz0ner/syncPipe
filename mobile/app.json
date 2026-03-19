@@ -1,36 +1,80 @@
 {
   "expo": {
-    "name": "mobile",
-    "slug": "mobile",
+    "name": "mcSync",
+    "slug": "mcsync",
     "version": "1.0.0",
+    "description": "Terminal-Driven Phone ↔ PC Sync Tool",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
+    "scheme": "mcsync",
+    "statusBar": {
+      "barStyle": "light-content",
+      "backgroundColor": "#0D1117",
+      "hidden": false,
+      "translucent": false
+    },
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#0D1117"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.svnsh.mcsync",
+      "icon": "./assets/icon.png",
+      "appStoreUrl": "https://apps.apple.com/app/mcsync",
+      "config": {
+        "usesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#0D1117",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "package": "com.svnsh.mobile"
+      "package": "com.svnsh.mcsync",
+      "permissions": [
+        "android.permission.INTERNET",
+        "android.permission.CHANGE_NETWORK_STATE",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ]
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/favicon.png",
+      "bundleUrl": "https://mcsync-app.web.app",
+      "name": "mcSync - Phone ↔ PC Sync",
+      "shortName": "mcSync",
+      "description": "Terminal-Driven Phone ↔ PC Sync Tool",
+      "barStyle": "dark-content",
+      "backgroundColor": "#0D1117",
+      "scope": "/",
+      "startUrl": "/"
     },
     "extra": {
       "eas": {
         "projectId": "5b39d3d2-165a-4da0-835a-0d08bf9991f2"
       }
     },
+    "plugins": [
+      [
+        "expo-clipboard",
+        {
+          "ios": true,
+          "android": true
+        }
+      ],
+      [
+        "expo-file-system",
+        {
+          "ios": true,
+          "android": true
+        }
+      ]
+    ],
     "runtimeVersion": {
       "policy": "appVersion"
     },

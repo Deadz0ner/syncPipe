@@ -2,7 +2,7 @@
  * HomeScreen - Main dashboard showing connection status and quick actions.
  */
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   View,
   Text,
@@ -11,7 +11,6 @@ import {
   FlatList,
   Alert,
   TextInput,
-  StatusBar,
   Animated,
   Platform,
 } from "react-native";
@@ -27,13 +26,24 @@ const HomeScreen = ({ navigation }) => {
   const [textInput, setTextInput] = useState("");
   const [receivedMessages, setReceivedMessages] = useState([]);
   const [pulseAnim] = useState(new Animated.Value(1));
+  const isReconnectingRef = useRef(false);
+
+  // Helper to add messages with a cap of 100 to prevent memory leaks
+  const addMessage = (msg) => {
+    setReceivedMessages((prev) => {
+      const updated = [msg, ...prev];
+      return updated.length > 100 ? updated.slice(0, 100) : updated;
+    });
+  };
 
   useEffect(() => {
     // Listen for connection status changes
-    wsService.onStatusChange((status, detail) => {
+    const unsubStatus = wsService.onStatusChange((status, detail) => {
       setConnectionStatus(status);
       if (detail && status === "authenticated") {
         setServerName(detail);
+      } else if (status !== "authenticated") {
+        setServerName("");
       }
     });
 
@@ -46,7 +56,7 @@ const HomeScreen = ({ navigation }) => {
         time: new Date().toLocaleTimeString(),
         direction: "received",
       };
-      setReceivedMessages((prev) => [msg, ...prev]);
+      addMessage(msg);
     });
 
     // Listen for clipboard sync
@@ -58,7 +68,7 @@ const HomeScreen = ({ navigation }) => {
         time: new Date().toLocaleTimeString(),
         direction: "received",
       };
-      setReceivedMessages((prev) => [msg, ...prev]);
+      addMessage(msg);
     });
 
     // Listen for file transfers (sent or received)
@@ -86,16 +96,17 @@ const HomeScreen = ({ navigation }) => {
         direction: data.direction === "send" ? "sent" : "received",
         path: data.path,
       };
-      setReceivedMessages((prev) => [msg, ...prev]);
+      addMessage(msg);
     });
 
     // Handle first-time setup for saving files (Android)
     checkFirstRunSetup();
 
-    // Auto-connect to last server
+    // Auto-connect to last server if enabled
     autoConnect();
 
     return () => {
+      unsubStatus();
       unsubText();
       unsubClip();
       unsubFile();
@@ -124,10 +135,15 @@ const HomeScreen = ({ navigation }) => {
     }
   }, [connectionStatus, pulseAnim]);
 
-  const autoConnect = async () => {
+  const autoConnect = async (ignoreSetting = false) => {
     try {
+      const settings = await deviceStore.getSettings();
+      if (!ignoreSetting && !settings.autoConnect) {
+        return false;
+      }
+
       const lastServer = await deviceStore.getLastServer();
-      if (lastServer) {
+      if (lastServer?.host && lastServer?.port && lastServer?.authToken) {
         const deviceId = await deviceStore.getOrCreateDeviceId();
         const deviceName = await deviceStore.getDeviceName();
         wsService.connect(lastServer.host, lastServer.port, {
@@ -135,20 +151,38 @@ const HomeScreen = ({ navigation }) => {
           authToken: lastServer.authToken,
           deviceName,
         });
+        return true;
       }
     } catch (e) {
       console.log("Auto-connect failed:", e.message);
     }
+
+    return false;
   };
 
-  const handleReconnect = () => {
-    if (connectionStatus !== "disconnected") {
-      wsService.disconnect();
-      setTimeout(() => {
-        autoConnect();
-      }, 500);
-    } else {
-      autoConnect();
+  const handleReconnect = async () => {
+    // Debounce rapid taps to prevent race conditions
+    if (isReconnectingRef.current) {
+      return;
+    }
+    isReconnectingRef.current = true;
+
+    try {
+      const didReconnect = wsService.reconnect();
+      if (!didReconnect) {
+        const didAutoConnect = await autoConnect(true);
+        if (!didAutoConnect) {
+          Alert.alert("No Saved Server", "Pair with a PC first.", [
+            {
+              text: "Pair Now",
+              onPress: () => navigation.navigate("Pair"),
+            },
+            { text: "Cancel", style: "cancel" },
+          ]);
+        }
+      }
+    } finally {
+      isReconnectingRef.current = false;
     }
   };
 
@@ -219,7 +253,7 @@ const HomeScreen = ({ navigation }) => {
       time: new Date().toLocaleTimeString(),
       direction: "sent",
     };
-    setReceivedMessages((prev) => [msg, ...prev]);
+    addMessage(msg);
     setTextInput("");
   };
 
@@ -320,8 +354,6 @@ const HomeScreen = ({ navigation }) => {
 
   return (
     <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#0D1117" />
-
       {/* Header */}
       <View style={styles.header}>
         <Text style={styles.title}>mcSync</Text>

@@ -39,7 +39,6 @@ const PairScreen = ({ navigation }) => {
   const [pairedServerName, setPairedServerName] = useState("");
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0.9)).current;
-  const pairTimer = useRef(null);
 
   useEffect(() => {
     Animated.parallel([
@@ -80,9 +79,8 @@ const PairScreen = ({ navigation }) => {
 
     return () => {
       unsubPair();
-      if (pairTimer.current) clearTimeout(pairTimer.current);
     };
-  }, [serverHost, serverPort, pairingCode]);
+  }, []);
 
   const handlePairSuccess = async (data) => {
     if (data.success) {

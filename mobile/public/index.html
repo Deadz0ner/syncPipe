@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0D1117">
+    <meta name="description" content="mcSync - Terminal-Driven Phone ↔ PC Sync Tool">
+
+    <title>mcSync - Phone ↔ PC Sync</title>
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96x96.png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+
+    <!-- Web App Manifest -->
+    <link rel="manifest" href="/manifest.json">
+
+    <!-- Preconnect to improve performance -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="dns-prefetch" href="https://fonts.gstatic.com">
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+            background-color: #0D1117;
+            color: #E6EDF3;
+            line-height: 1.6;
+        }
+
+        #root {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 600px;
+            text-align: center;
+        }
+
+        .logo {
+            width: 120px;
+            height: 120px;
+            margin-bottom: 24px;
+            opacity: 0.9;
+            animation: float 3s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-20px); }
+        }
+
+        h1 {
+            font-size: 32px;
+            font-weight: 800;
+            margin-bottom: 12px;
+            background: linear-gradient(135deg, #1F6FEB 0%, #238636 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle {
+            font-size: 18px;
+            color: #8B949E;
+            margin-bottom: 32px;
+        }
+
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 16px;
+            margin-bottom: 32px;
+        }
+
+        .feature {
+            background: #161B22;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #21262D;
+        }
+
+        .feature-icon {
+            font-size: 32px;
+            margin-bottom: 8px;
+        }
+
+        .feature-text {
+            font-size: 14px;
+            color: #8B949E;
+        }
+
+        .cta-button {
+            display: inline-block;
+            background: linear-gradient(135deg, #1F6FEB 0%, #238636 100%);
+            color: white;
+            padding: 12px 32px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 16px;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            margin: 0 8px;
+        }
+
+        .cta-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(31, 111, 235, 0.3);
+        }
+
+        .cta-button.secondary {
+            background: #161B22;
+            border: 1px solid #21262D;
+            color: #1F6FEB;
+        }
+
+        .cta-button.secondary:hover {
+            border-color: #1F6FEB;
+        }
+
+        .status {
+            margin-top: 32px;
+            padding: 16px;
+            background: #161B22;
+            border-radius: 6px;
+            border-left: 4px solid #238636;
+            font-size: 14px;
+            color: #8B949E;
+        }
+
+        .status.warning {
+            border-left-color: #FFC107;
+        }
+
+        @media (max-width: 600px) {
+            h1 {
+                font-size: 24px;
+            }
+
+            .subtitle {
+                font-size: 16px;
+            }
+
+            .features {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="root">
+        <div class="container">
+            <img src="/web-app-manifest-512x512.png" alt="mcSync Logo" class="logo">
+
+            <h1>mcSync</h1>
+            <p class="subtitle">Terminal-Driven Phone ↔ PC Sync</p>
+
+            <div class="features">
+                <div class="feature">
+                    <div class="feature-icon">📄</div>
+                    <div class="feature-text">Files</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">📝</div>
+                    <div class="feature-text">Text</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">📋</div>
+                    <div class="feature-text">Clipboard</div>
+                </div>
+            </div>
+
+            <div>
+                <a href="https://github.com/svnsh/mcsync" class="cta-button">View on GitHub</a>
+                <a href="#" class="cta-button secondary">Documentation</a>
+            </div>
+
+            <div class="status">
+                ℹ️ mcSync is primarily a mobile app. Download the mobile app from the App Store or Google Play to get started.
+            </div>
+        </div>
+    </div>
+
+    <!-- PWA Script -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js').catch(() => {
+                // Service worker not available
+            });
+        }
+
+        // Install PWA prompt
+        let installPrompt = null;
+        window.addEventListener('beforeinstallprompt', (e) => {
+            e.preventDefault();
+            installPrompt = e;
+        });
+    </script>
+</body>
+</html>
