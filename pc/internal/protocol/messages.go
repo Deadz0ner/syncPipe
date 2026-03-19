@@ -12,6 +12,7 @@ const (
 	TypeAuthResp  = "AUTH_RESP"
 	TypeText      = "TEXT"
 	TypeFileStart = "FILE_START"
+	TypeFileMeta  = "FILE_META"
 	TypeFileChunk = "FILE_CHUNK"
 	TypeFileEnd   = "FILE_END"
 	TypeClipboard = "CLIPBOARD"
@@ -101,12 +102,19 @@ type FileStartPayload struct {
 	TransferID string `json:"transfer_id"`
 }
 
-// FileChunkPayload carries a chunk of file data (base64 encoded)
+// FileChunkPayload carries a chunk of file data (base64 encoded - LEGACY)
 type FileChunkPayload struct {
 	TransferID string `json:"transfer_id"`
 	Index      int    `json:"index"`
 	Data       string `json:"data"` // base64 encoded
 	Size       int    `json:"size"`
+}
+
+// FileMetaPayload signals the beginning of a file transfer (MODERN)
+type FileMetaPayload struct {
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
+	TransferID string `json:"transfer_id"`
 }
 
 // FileEndPayload signals the end of a file transfer
@@ -146,8 +154,10 @@ type ErrorPayload struct {
 
 // AckPayload acknowledges receipt of a message
 type AckPayload struct {
-	MessageID string `json:"message_id"`
-	Status    string `json:"status"` // "ok" or "error"
+	MessageID  string `json:"message_id,omitempty"`
+	Status     string `json:"status,omitempty"` // "ok" or "error"
+	TransferID string `json:"transfer_id,omitempty"`
+	Chunk      int    `json:"chunk,omitempty"`
 }
 
 // --- Helper ---

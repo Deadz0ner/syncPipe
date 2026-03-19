@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"mcsync/internal/clipboard"
@@ -26,7 +28,7 @@ const banner = `
  | | | | | | (__\__ \ |_| | | | | (__ 
  |_| |_| |_|\___|___/\__, |_| |_|\___|
                        |___/            
-  Terminal-Driven Phone ↔ PC Sync
+  Terminal-Driven Phone ↔ PC Sync (Go)
   v%s
 `
 
@@ -35,7 +37,74 @@ var (
 	srv         *server.Server
 	cfg         *config.Config
 	deviceStore *store.Store
+	consoleMu   sync.Mutex
 )
+
+// safeWriter ensures that background logs don't overwrite the REPL prompt
+type safeWriter struct {
+	out io.Writer
+}
+
+func (w safeWriter) Write(p []byte) (n int, err error) {
+	consoleMu.Lock()
+	defer consoleMu.Unlock()
+
+	// Clear current line (where prompt might be)
+	fmt.Fprint(w.out, "\r\033[K")
+
+	// Write the log message
+	n, err = w.out.Write(p)
+
+	// Redraw prompt if it's supposed to be there
+	fmt.Fprint(w.out, "mcSync> ")
+	return
+}
+
+func firstRunSetup(cfg *config.Config) {
+	fmt.Println(`
+  ╔═══════════════════════════════════════════════════════╗
+  ║           📂 First-Time Setup — File Storage          ║
+  ╠═══════════════════════════════════════════════════════╣
+  ║                                                       ║
+  ║  mcSync needs a directory to save files received      ║
+  ║  from your phone.                                     ║
+  ║                                                       ║
+  ║  Current default:                                     ║`)
+	fmt.Printf("  ║    %-47s║\n", cfg.ReceiveDir)
+	fmt.Println(`  ║                                                       ║
+  ║  Press ENTER to keep the default, or type a new       ║
+  ║  absolute path (e.g. /home/user/Downloads/mcSync).    ║
+  ╚═══════════════════════════════════════════════════════╝`)
+	fmt.Println()
+	fmt.Print("  Save received files to: ")
+
+	scanner := bufio.NewScanner(os.Stdin)
+	if scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+		if input != "" {
+			resolvedPath, err := filepath.Abs(input)
+			if err == nil {
+				if err := os.MkdirAll(resolvedPath, 0755); err == nil {
+					cfg.ReceiveDir = resolvedPath
+					fmt.Printf("\n  ✓ Receive directory set to: %s\n", resolvedPath)
+				} else {
+					fmt.Printf("\n  ✗ Could not create directory: %v\n", err)
+					fmt.Printf("  → Keeping default: %s\n", cfg.ReceiveDir)
+				}
+			} else {
+				fmt.Printf("\n  ✗ Invalid path: %v\n", err)
+				fmt.Printf("  → Keeping default: %s\n", cfg.ReceiveDir)
+			}
+		} else {
+			fmt.Printf("\n  ✓ Using default: %s\n", cfg.ReceiveDir)
+		}
+	}
+
+	cfg.FirstRun = false
+	if err := cfg.Save(); err != nil {
+		fmt.Printf("  ✗ Failed to save config: %v\n", err)
+	}
+}
 
 func main() {
 	fmt.Printf(banner, version)
@@ -57,6 +126,10 @@ func main() {
 		if err := cfg.Save(); err != nil {
 			log.Fatalf("Failed to save config: %v", err)
 		}
+	}
+
+	if cfg.FirstRun {
+		firstRunSetup(cfg)
 	}
 
 	// Open encrypted device store
@@ -89,9 +162,10 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Suppress default log prefix clutter while in REPL
+	// Setup safe logging for REPL
 	log.SetFlags(0)
 	log.SetPrefix("  [log] ")
+	log.SetOutput(safeWriter{out: os.Stdout})
 
 	// Start the interactive REPL
 	repl()
@@ -101,7 +175,9 @@ func repl() {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
+		// No need to Lock here as Scan() is blocking and we want the prompt to appear initially
 		fmt.Print("mcSync> ")
+
 		if !scanner.Scan() {
 			break // EOF or error
 		}
@@ -138,6 +214,37 @@ func repl() {
 			cmdStatus()
 		case "connected":
 			cmdConnected()
+		case "rename", "rn":
+			if len(args) == 0 {
+				fmt.Printf("  Current name: %s\n", cfg.DeviceName)
+				fmt.Println("  Usage: rename <new_name>")
+				continue
+			}
+			newName := strings.Join(args, " ")
+			cfg.DeviceName = newName
+			cfg.Save()
+			if srv != nil {
+				srv.UpdateDeviceName(newName)
+			}
+			fmt.Printf("  ✓ Device name changed to: %s\n", newName)
+		case "set-dir", "sd", "savedir":
+			if len(args) == 0 {
+				fmt.Printf("  Current receive directory: %s\n", cfg.ReceiveDir)
+				fmt.Println("  Usage: set-dir <path>")
+				continue
+			}
+			newDir, err := filepath.Abs(strings.Join(args, " "))
+			if err != nil {
+				fmt.Printf("  ✗ Invalid path: %v\n", err)
+				continue
+			}
+			if err := os.MkdirAll(newDir, 0755); err != nil {
+				fmt.Printf("  ✗ Failed to create directory: %v\n", err)
+				continue
+			}
+			cfg.ReceiveDir = newDir
+			cfg.Save()
+			fmt.Printf("  ✓ Receive directory changed to: %s\n", newDir)
 		case "help", "h", "?":
 			cmdHelp()
 		case "clear", "cls":
@@ -156,21 +263,23 @@ func repl() {
 
 func cmdHelp() {
 	fmt.Print(`
-  ╔═══════════════════════════════════════════════════╗
-  ║              mcSync Commands                      ║
-  ╠════════════╦══════════════════════════════════════╣
-  ║ pair       ║ Generate a pairing code              ║
-  ║ text <msg> ║ Send text to phone                   ║
-  ║ file <path>║ Send a file to phone                 ║
-  ║ clip       ║ Send PC clipboard to phone           ║
-  ║ devices    ║ List paired devices                  ║
-  ║ connected  ║ Show currently connected devices     ║
-  ║ status     ║ Show server status                   ║
-  ║ clear      ║ Clear the screen                     ║
-  ║ quit       ║ Stop the server and exit             ║
-  ╚════════════╩══════════════════════════════════════╝
+  ╔════════════════════════════════════════════════════════╗
+  ║               mcSync Commands (Go)                     ║
+  ╠═══════════════╦════════════════════════════════════════╣
+  ║ pair          ║ Generate a pairing code               ║
+  ║ text <msg>    ║ Send text to phone                    ║
+  ║ file <path>   ║ Send a file to phone                  ║
+  ║ clip          ║ Send PC clipboard to phone            ║
+  ║ devices       ║ List paired devices                   ║
+  ║ connected     ║ Show currently connected devices      ║
+  ║ rename <name> ║ Change PC device name                 ║
+  ║ set-dir <path>║ Change where received files are saved ║
+  ║ status        ║ Show server status                    ║
+  ║ clear         ║ Clear the screen                      ║
+  ║ quit          ║ Stop the server and exit              ║
+  ╚═══════════════╩════════════════════════════════════════╝
 
-  Aliases: pair(p) text(st) file(sf) clip(cb) devices(ls) quit(q,exit)
+  Aliases: pair(p) text(st) file(sf) clip(cb) devices(ls) rename(rn) set-dir(sd) quit(q,exit)
 
 `)
 }
@@ -293,7 +402,7 @@ func cmdStatus() {
 	localIP := discovery.GetLocalIP()
 	devs := srv.GetConnectedDevices()
 	fmt.Println()
-	fmt.Println("  mcSync Status")
+	fmt.Println("  mcSync Status (Go)")
 	fmt.Println("  ─────────────────────────────")
 	fmt.Printf("  Device:     %s\n", cfg.DeviceName)
 	fmt.Printf("  Local IP:   %s\n", localIP)

@@ -11,9 +11,9 @@ const (
 	AppName        = "mcsync"
 	DefaultPort    = 9090
 	ServiceType    = "_mcsync._tcp"
-	ChunkSize      = 64 * 1024   // 64KB chunks for file transfer
-	PingInterval   = 15          // seconds
-	MaxMessageSize = 1024 * 1024 // 1MB max WebSocket frame
+	ChunkSize      = 61440            // 60KB chunks (multiple of 3) for file transfer
+	PingInterval   = 15               // seconds
+	MaxMessageSize = 10 * 1024 * 1024 // 10MB max WebSocket frame
 )
 
 // Config holds the application configuration
@@ -24,6 +24,7 @@ type Config struct {
 	DataDir       string `json:"data_dir"`
 	ReceiveDir    string `json:"receive_dir"`
 	ClipboardSync bool   `json:"clipboard_sync"`
+	FirstRun      bool   `json:"first_run"`
 }
 
 // DefaultConfig returns a new config with sensible defaults
@@ -38,6 +39,7 @@ func DefaultConfig() *Config {
 		DataDir:       dataDir,
 		ReceiveDir:    filepath.Join(dataDir, "received"),
 		ClipboardSync: true,
+		FirstRun:      true,
 	}
 }
 

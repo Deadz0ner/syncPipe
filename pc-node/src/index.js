@@ -1,5 +1,6 @@
 const readline = require("readline");
 const path = require("path");
+const fs = require("fs-extra");
 const { Config } = require("./internal/config");
 const Store = require("./internal/store");
 const Server = require("./internal/server");
@@ -18,6 +19,57 @@ const banner = `
   v1.0.0
 `;
 
+/**
+ * First-time setup: ask user where to save received files.
+ * Uses a temporary readline interface so the main REPL isn't active yet.
+ */
+async function firstRunSetup(cfg) {
+  return new Promise((resolve) => {
+    const setupRl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    console.log(`
+  ╔═══════════════════════════════════════════════════════╗
+  ║           📂 First-Time Setup — File Storage          ║
+  ╠═══════════════════════════════════════════════════════╣
+  ║                                                       ║
+  ║  mcSync needs a directory to save files received      ║
+  ║  from your phone.                                     ║
+  ║                                                       ║
+  ║  Current default:                                     ║
+  ║    ${cfg.receive_dir.padEnd(47)}  ║
+  ║                                                       ║
+  ║  Press ENTER to keep the default, or type a new       ║
+  ║  absolute path (e.g. /home/user/Downloads/mcSync).    ║
+  ╚═══════════════════════════════════════════════════════╝
+`);
+
+    setupRl.question("  Save received files to: ", async (answer) => {
+      const input = answer.trim();
+      if (input) {
+        const resolvedPath = path.resolve(input);
+        try {
+          await fs.ensureDir(resolvedPath);
+          cfg.receive_dir = resolvedPath;
+          console.log(`\n  ✓ Receive directory set to: ${resolvedPath}`);
+        } catch (err) {
+          console.error(`\n  ✗ Could not create directory: ${err.message}`);
+          console.log(`  → Keeping default: ${cfg.receive_dir}`);
+        }
+      } else {
+        console.log(`\n  ✓ Using default: ${cfg.receive_dir}`);
+      }
+
+      cfg.first_run = false;
+      await cfg.save();
+      setupRl.close();
+      resolve();
+    });
+  });
+}
+
 async function main() {
   process.stdout.write(banner);
 
@@ -27,11 +79,59 @@ async function main() {
     await cfg.save();
   }
 
+  // ─── First-run: ask where to save received files ───────────
+  if (cfg.first_run) {
+    await firstRunSetup(cfg);
+  }
+
   const store = await Store.create(cfg.data_dir);
-  const server = new Server(cfg, store);
+
+  // Initialize REPL early to handle logging
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: "mcSync-node> ",
+  });
+
+  let isClosing = false;
+
+  const logger = {
+    info: (msg) => {
+      if (process.stdout.isTTY) {
+        readline.cursorTo(process.stdout, 0);
+        readline.clearLine(process.stdout, 0);
+      }
+      console.log(msg);
+      if (!isClosing) rl.prompt(true);
+    },
+    warn: (msg) => {
+      if (process.stdout.isTTY) {
+        readline.cursorTo(process.stdout, 0);
+        readline.clearLine(process.stdout, 0);
+      }
+      console.warn(msg);
+      if (!isClosing) rl.prompt(true);
+    },
+    error: (msg) => {
+      if (process.stdout.isTTY) {
+        readline.cursorTo(process.stdout, 0);
+        readline.clearLine(process.stdout, 0);
+      }
+      console.error(msg);
+      if (!isClosing) rl.prompt(true);
+    },
+  };
+
+  const server = new Server(cfg, store, logger);
+
+  // Note: DiscoveryService is currently created inside server.start in current implementation,
+  // but let's check if we can pass logger through.
+  // Looking at server.js: this.discovery = new DiscoveryService(this.cfg.port, this.cfg.device_name);
+  // I should update server.js to pass this.logger to DiscoveryService.
+
   await server.start();
 
-  const clip = new ClipboardMonitor();
+  const clip = new ClipboardMonitor(1500, logger);
   if (cfg.clipboard_sync) {
     await clip.start();
     clip.on("change", (content) => {
@@ -42,20 +142,21 @@ async function main() {
     });
     server.on("clipboard", (content) => {
       clip.write(content);
+      const lines = (content || "").split("\n");
+      let output = `\n  ╭─── 📋 Clipboard Synced ───\n`;
+      lines.forEach((line) => {
+        output += `  │ ${line}\n`;
+      });
+      output += `  ╰────────────────────────────────────────\n`;
+      logger.info(output);
     });
   }
 
   const localIP = DiscoveryService.getLocalIP();
-  process.stdout.write(`\n  ✓ Server running on ${localIP}:${cfg.port}\n`);
-  process.stdout.write(`  ✓ Device: ${cfg.device_name}\n`);
-  process.stdout.write(`  ✓ Receive directory: ${cfg.receive_dir}\n\n`);
-  process.stdout.write(`  Type 'help' for available commands.\n\n`);
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: "mcSync-node> ",
-  });
+  logger.info(`\n  ✓ Server running on ${localIP}:${cfg.port}`);
+  logger.info(`  ✓ Device: ${cfg.device_name}`);
+  logger.info(`  ✓ Receive directory: ${cfg.receive_dir}\n`);
+  logger.info(`  Type 'help' for available commands.\n`);
 
   rl.prompt();
 
@@ -74,18 +175,18 @@ async function main() {
       switch (command) {
         case "pair":
         case "p":
-          await cmdPair(server, cfg);
+          await cmdPair(server, cfg, logger);
           break;
         case "send-text":
         case "st":
         case "text": {
           if (args.length === 0) {
-            process.stdout.write("  Usage: send-text <message>\n");
+            logger.info("  Usage: send-text <message>");
           } else {
             const text = args.join(" ");
             await server.sendText(null, text);
-            process.stdout.write(
-              `  ✓ Sent: ${text.length > 60 ? text.slice(0, 60) + "..." : text}\n`,
+            logger.info(
+              `  ✓ Sent: ${text.length > 60 ? text.slice(0, 60) + "..." : text}`,
             );
           }
           break;
@@ -94,11 +195,11 @@ async function main() {
         case "sf":
         case "file": {
           if (args.length === 0) {
-            process.stdout.write("  Usage: send-file <filepath>\n");
+            logger.info("  Usage: send-file <filepath>");
           } else {
             const filePath = path.resolve(args[0]);
             await server.sendFile(null, filePath);
-            process.stdout.write(`  ✓ File sent: ${path.basename(filePath)}\n`);
+            logger.info(`  ✓ File sent: ${path.basename(filePath)}`);
           }
           break;
         }
@@ -107,33 +208,69 @@ async function main() {
         case "clip": {
           const content = await clip.read();
           if (!content) {
-            process.stdout.write("  ✗ Clipboard is empty.\n");
+            logger.info("  ✗ Clipboard is empty.");
           } else {
             await server.sendClipboard(null, content);
-            process.stdout.write(
-              `  ✓ Clipboard sent: ${content.length > 60 ? content.slice(0, 60) + "..." : content}\n`,
+            logger.info(
+              `  ✓ Clipboard sent: ${content.length > 60 ? content.slice(0, 60) + "..." : content}`,
             );
           }
           break;
         }
         case "devices":
         case "ls":
-          cmdDevices(store);
+          cmdDevices(store, logger);
           break;
         case "status":
-          cmdStatus(cfg, server);
+          cmdStatus(cfg, server, logger);
           break;
         case "connected":
-          cmdConnected(server);
+          cmdConnected(server, logger);
           break;
+        case "rename":
+        case "rn": {
+          if (args.length === 0) {
+            logger.info(`  Current name: ${cfg.device_name}`);
+            logger.info(`  Usage: rename <new_name>`);
+          } else {
+            const newName = args.join(" ");
+            cfg.device_name = newName;
+            await cfg.save();
+            if (server.discovery) {
+              server.discovery.deviceName = newName;
+            }
+            logger.info(`  ✓ Device name changed to: ${newName}`);
+          }
+          break;
+        }
+        case "set-dir":
+        case "sd":
+        case "savedir": {
+          if (args.length === 0) {
+            logger.info(`  Current receive directory: ${cfg.receive_dir}`);
+            logger.info(`  Usage: set-dir <path>`);
+          } else {
+            const newDir = path.resolve(args.join(" "));
+            try {
+              await fs.ensureDir(newDir);
+              cfg.receive_dir = newDir;
+              await cfg.save();
+              logger.info(`  ✓ Receive directory changed to: ${newDir}`);
+            } catch (err) {
+              logger.info(`  ✗ Failed: ${err.message}`);
+            }
+          }
+          break;
+        }
         case "help":
         case "h":
         case "?":
-          cmdHelp();
+          cmdHelp(logger);
           break;
         case "clear":
         case "cls":
           console.clear();
+          rl.prompt();
           break;
         case "quit":
         case "exit":
@@ -141,18 +278,19 @@ async function main() {
           rl.close();
           return;
         default:
-          process.stdout.write(
-            `  Unknown command: ${command} — type 'help' for the list.\n`,
+          logger.info(
+            `  Unknown command: ${command} — type 'help' for the list.`,
           );
       }
     } catch (err) {
-      process.stdout.write(`  ✗ Error: ${err.message}\n`);
+      logger.info(`  ✗ Error: ${err.message}`);
     }
 
     rl.prompt();
   });
 
   rl.on("close", () => {
+    isClosing = true;
     process.stdout.write("\n  Shutting down...\n");
     server.stop();
     clip.stop();
@@ -160,30 +298,32 @@ async function main() {
   });
 }
 
-function cmdHelp() {
-  process.stdout.write(`
-  ╔═══════════════════════════════════════════════════╗
-  ║              mcSync Commands (Node.js)            ║
-  ╠════════════╦══════════════════════════════════════╣
-  ║ pair       ║ Generate a pairing code              ║
-  ║ text <msg> ║ Send text to phone                   ║
-  ║ file <path>║ Send a file to phone                 ║
-  ║ clip       ║ Send PC clipboard to phone           ║
-  ║ devices    ║ List paired devices                  ║
-  ║ connected  ║ Show currently connected devices     ║
-  ║ status     ║ Show server status                   ║
-  ║ clear      ║ Clear the screen                     ║
-  ║ quit       ║ Stop the server and exit             ║
-  ╚════════════╩══════════════════════════════════════╝
+function cmdHelp(logger) {
+  logger.info(`
+  ╔════════════════════════════════════════════════════════╗
+  ║               mcSync Commands (Node.js)               ║
+  ╠═══════════════╦════════════════════════════════════════╣
+  ║ pair          ║ Generate a pairing code               ║
+  ║ text <msg>    ║ Send text to phone                    ║
+  ║ file <path>   ║ Send a file to phone                  ║
+  ║ clip          ║ Send PC clipboard to phone            ║
+  ║ devices       ║ List paired devices                   ║
+  ║ connected     ║ Show currently connected devices      ║
+  ║ rename <name> ║ Change PC device name                 ║
+  ║ set-dir <path>║ Change where received files are saved ║
+  ║ status        ║ Show server status                    ║
+  ║ clear         ║ Clear the screen                      ║
+  ║ quit          ║ Stop the server and exit              ║
+  ╚═══════════════╩════════════════════════════════════════╝
 
-  Aliases: pair(p) text(st) file(sf) clip(cb) devices(ls) quit(q,exit)\n\n`);
+  Aliases: pair(p) text(st) file(sf) clip(cb) devices(ls) rename(rn) set-dir(sd) quit(q,exit)\n`);
 }
 
-async function cmdPair(server, cfg) {
+async function cmdPair(server, cfg, logger) {
   const code = await server.startPairing();
   const localIP = DiscoveryService.getLocalIP();
 
-  process.stdout.write(`
+  logger.info(`
   ╔═══════════════════════════════════════╗
   ║         mcSync Device Pairing         ║
   ╠═══════════════════════════════════════╣
@@ -196,55 +336,52 @@ async function cmdPair(server, cfg) {
   ║  and enter this code to pair.         ║
   ║                                       ║
   ║  Code expires in 5 minutes.           ║
-  ╚═══════════════════════════════════════╝\n\n`);
+  ╚═══════════════════════════════════════╝\n`);
 }
 
-function cmdDevices(store) {
+function cmdDevices(store, logger) {
   const devices = store.listDevices();
   if (devices.length === 0) {
-    process.stdout.write("  No paired devices. Type 'pair' to add one.\n");
+    logger.info("  No paired devices. Type 'pair' to add one.");
     return;
   }
 
-  process.stdout.write("\n  Paired Devices:\n");
-  process.stdout.write("  ───────────────────────────────────────\n");
+  let output = "\n  Paired Devices:\n";
+  output += "  ───────────────────────────────────────\n";
   devices.forEach((d) => {
-    process.stdout.write(`  • ${d.device_name}\n`);
-    process.stdout.write(`    ID:        ${d.device_id.slice(0, 16)}...\n`);
-    process.stdout.write(
-      `    Paired:    ${new Date(d.paired_at).toLocaleString()}\n`,
-    );
-    process.stdout.write(
-      `    Last Seen: ${new Date(d.last_seen).toLocaleString()}\n\n`,
-    );
+    output += `  • ${d.device_name}\n`;
+    output += `    ID:        ${d.device_id.slice(0, 16)}...\n`;
+    output += `    Paired:    ${new Date(d.paired_at).toLocaleString()}\n`;
+    output += `    Last Seen: ${new Date(d.last_seen).toLocaleString()}\n\n`;
   });
+  logger.info(output);
 }
 
-function cmdConnected(server) {
+function cmdConnected(server, logger) {
   const devs = server.getConnectedDevices();
   if (devs.length === 0) {
-    process.stdout.write("  No devices currently connected.\n");
+    logger.info("  No devices currently connected.");
     return;
   }
 
-  process.stdout.write("\n  Connected Devices:\n");
+  let output = "\n  Connected Devices:\n";
   devs.forEach((id, i) => {
-    process.stdout.write(`  ${i + 1}. ${id}\n`);
+    output += `  ${i + 1}. ${id}\n`;
   });
-  process.stdout.write("\n");
+  logger.info(output);
 }
 
-function cmdStatus(cfg, server) {
+function cmdStatus(cfg, server, logger) {
   const localIP = DiscoveryService.getLocalIP();
   const devs = server.getConnectedDevices();
-  process.stdout.write(`
+  logger.info(`
   mcSync Status (Node.js)
   ─────────────────────────────
   Device:     ${cfg.device_name}
   Local IP:   ${localIP}
   Port:       ${cfg.port}
   Data Dir:   ${cfg.data_dir}
-  Connected:  ${devs.length} device(s)\n\n`);
+  Connected:  ${devs.length} device(s)\n`);
 }
 
 main().catch(console.error);

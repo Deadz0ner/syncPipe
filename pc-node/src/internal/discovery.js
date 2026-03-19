@@ -2,10 +2,15 @@ const mdns = require("multicast-dns")();
 const os = require("os");
 
 class DiscoveryService {
-  constructor(port, deviceName) {
+  constructor(port, deviceName, logger = null) {
     this.port = port;
     this.deviceName = deviceName;
     this.serviceType = "_mcsync._tcp.local";
+    this.logger = logger || {
+      info: (...args) => console.log(...args),
+      warn: (...args) => console.warn(...args),
+      error: (...args) => console.error(...args),
+    };
   }
 
   start() {
@@ -15,7 +20,9 @@ class DiscoveryService {
       }
     });
 
-    console.log(`[mDNS] Advertising ${this.serviceType} on port ${this.port}`);
+    this.logger.info(
+      `[mDNS] Advertising ${this.serviceType} on port ${this.port}`,
+    );
   }
 
   respond() {
@@ -54,7 +61,7 @@ class DiscoveryService {
 
   stop() {
     mdns.destroy();
-    console.log(`[mDNS] Service stopped`);
+    this.logger.info(`[mDNS] Service stopped`);
   }
 
   static getLocalIPs() {

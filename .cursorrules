@@ -1,0 +1,7 @@
+# Backend Sync Rule
+
+CRITICAL RULE: This project contains two backend implementations:
+1. Go Backend: `pc/`
+2. Node.js Backend: `pc-node/`
+
+Whenever you make a functional, structural, or logical change to one of these backends, YOU MUST make the exact equivalent change to the other backend to ensure both remain 100% synchronized and consistent. Both backends must handle the same endpoints, use the same message structures, and support the mobile/frontend in the exact same manner.

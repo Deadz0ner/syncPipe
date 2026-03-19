@@ -6,12 +6,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +46,9 @@ type Server struct {
 	// Active file transfers
 	transfers   map[string]*FileTransfer
 	transfersMu sync.Mutex
+
+	ackCallbacks map[string]chan int
+	ackMu        sync.Mutex
 }
 
 // Client represents a connected phone
@@ -53,6 +58,9 @@ type Client struct {
 	Conn       *websocket.Conn
 	Authed     bool
 	mu         sync.Mutex
+
+	// Current binary transfer for this connection
+	ActiveTransfer *FileTransfer
 }
 
 // FileTransfer tracks an ongoing file transfer
@@ -63,8 +71,9 @@ type FileTransfer struct {
 	ChunkSize   int
 	Received    int
 	TotalChunks int
+	TotalBytes  int64
 	File        *os.File
-	Hash        []byte
+	Hasher      hash.Hash
 	StartTime   time.Time
 }
 
@@ -73,12 +82,13 @@ func New(cfg *config.Config, deviceStore *store.Store) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		cfg:       cfg,
-		store:     deviceStore,
-		clients:   make(map[string]*Client),
-		transfers: make(map[string]*FileTransfer),
-		ctx:       ctx,
-		cancel:    cancel,
+		cfg:          cfg,
+		store:        deviceStore,
+		clients:      make(map[string]*Client),
+		transfers:    make(map[string]*FileTransfer),
+		ackCallbacks: make(map[string]chan int),
+		ctx:          ctx,
+		cancel:       cancel,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  config.MaxMessageSize,
 			WriteBufferSize: config.MaxMessageSize,
@@ -112,15 +122,12 @@ func (s *Server) Start() error {
 		// Non-fatal, continue without mDNS
 	}
 
-	// Automatic clipboard monitor has been explicitly disabled. Must sync manually via triggers.
-	// We no longer automatically call s.clipMonitor.Start() here.
-
 	// HTTP routes
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWebSocket)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/info", s.handleInfo)
-	mux.HandleFunc("/pair-http", s.handlePairHTTP) // NEW: HTTP pairing endpoint
+	mux.HandleFunc("/pair-http", s.handlePairHTTP)
 
 	s.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.cfg.Port),
@@ -130,17 +137,13 @@ func (s *Server) Start() error {
 	// Start serving
 	go func() {
 		localIP := discovery.GetLocalIP()
-
-		// Attempt to create a listener first to catch "address already in use" errors synchronously
-		// Use 0.0.0.0 to force IPv4 for better compatibility with phone hotspots
 		addr := fmt.Sprintf("0.0.0.0:%d", s.cfg.Port)
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			log.Fatalf("\n  ✗ FATAL: Failed to start server: %v\n  Something else is already using port %d. Use 'lsof -i :%d' to find it.\n", err, s.cfg.Port, s.cfg.Port)
+			log.Fatalf("\n  ✗ FATAL: Failed to start server: %v\n", err)
 		}
 
 		log.Printf("[Server] Listening on 0.0.0.0:%d (Accessible at %s:%d)", s.cfg.Port, localIP, s.cfg.Port)
-		log.Printf("[Server] WebSocket endpoint: ws://%s:%d/ws", localIP, s.cfg.Port)
 
 		if err := s.httpServer.Serve(ln); err != http.ErrServerClosed {
 			log.Fatalf("[Server] HTTP server error: %v", err)
@@ -163,7 +166,6 @@ func (s *Server) Stop() {
 	}
 	s.clipMonitor.Stop()
 
-	// Close all client connections
 	s.mu.Lock()
 	for _, c := range s.clients {
 		c.Conn.Close()
@@ -179,6 +181,18 @@ func (s *Server) Stop() {
 	log.Println("[Server] Shutdown complete")
 }
 
+// UpdateDeviceName changes the server device name and restarts mDNS
+func (s *Server) UpdateDeviceName(newName string) {
+	s.cfg.DeviceName = newName
+	if s.mdns != nil {
+		s.mdns.Stop()
+		s.mdns = discovery.NewService(s.cfg.Port, newName)
+		if err := s.mdns.Start(); err != nil {
+			log.Printf("[Server] Warning: mDNS restart failed: %v", err)
+		}
+	}
+}
+
 // StartPairing begins the pairing process
 func (s *Server) StartPairing() (string, error) {
 	code, err := store.GeneratePairingCode()
@@ -190,7 +204,6 @@ func (s *Server) StartPairing() (string, error) {
 	s.pairingActive = true
 	s.mu.Unlock()
 
-	// Auto-expire pairing after 5 minutes
 	go func() {
 		time.Sleep(5 * time.Minute)
 		s.mu.Lock()
@@ -205,7 +218,6 @@ func (s *Server) StartPairing() (string, error) {
 	return code, nil
 }
 
-// handleWebSocket handles new WebSocket connections
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -216,38 +228,41 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	remoteAddr := r.RemoteAddr
 	log.Printf("[Server] New connection from %s", remoteAddr)
 
-	// Create an unauthenticated client
 	client := &Client{
 		Conn:   conn,
 		Authed: false,
 	}
 
-	// Handle the connection
 	go s.handleClient(client, remoteAddr)
 }
 
-// handleClient manages the lifecycle of a single client connection
 func (s *Server) handleClient(client *Client, remoteAddr string) {
 	defer func() {
 		client.Conn.Close()
 		if client.DeviceID != "" {
 			s.mu.Lock()
-			delete(s.clients, client.DeviceID)
+			if s.clients[client.DeviceID] == client {
+				delete(s.clients, client.DeviceID)
+				log.Printf("[Server] Device %s (%s) disconnected", client.DeviceName, client.DeviceID[:8])
+			}
 			s.mu.Unlock()
-			log.Printf("[Server] Device %s (%s) disconnected", client.DeviceName, client.DeviceID[:8])
 		}
 	}()
 
-	// Set read limits
 	client.Conn.SetReadLimit(int64(config.MaxMessageSize))
 
 	for {
-		_, rawMsg, err := client.Conn.ReadMessage()
+		messageType, rawMsg, err := client.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				log.Printf("[Server] Read error from %s: %v", remoteAddr, err)
 			}
 			return
+		}
+
+		if messageType == websocket.BinaryMessage {
+			s.handleBinaryChunk(client, rawMsg)
+			continue
 		}
 
 		msg, err := protocol.DecodeMessage(rawMsg)
@@ -256,7 +271,6 @@ func (s *Server) handleClient(client *Client, remoteAddr string) {
 			continue
 		}
 
-		// Route message
 		switch msg.Type {
 		case protocol.TypeAuth:
 			s.handleAuth(client, msg, remoteAddr)
@@ -268,6 +282,8 @@ func (s *Server) handleClient(client *Client, remoteAddr string) {
 			s.handleClipboard(client, msg)
 		case protocol.TypeFileStart:
 			s.handleFileStart(client, msg)
+		case protocol.TypeFileMeta:
+			s.handleFileMeta(client, msg)
 		case protocol.TypeFileChunk:
 			s.handleFileChunk(client, msg)
 		case protocol.TypeFileEnd:
@@ -276,14 +292,14 @@ func (s *Server) handleClient(client *Client, remoteAddr string) {
 			resp, _ := protocol.NewMessage(protocol.TypePong, nil)
 			s.sendMessage(client, resp)
 		case protocol.TypePong:
-			// keepalive response, no action needed
+		case protocol.TypeAck:
+			s.handleAck(client, msg)
 		default:
 			log.Printf("[Server] Unknown message type: %s", msg.Type)
 		}
 	}
 }
 
-// handleAuth processes authentication from a paired device
 func (s *Server) handleAuth(client *Client, msg *protocol.Message, remoteAddr string) {
 	var payload protocol.AuthPayload
 	if err := msg.ParseData(&payload); err != nil {
@@ -300,16 +316,17 @@ func (s *Server) handleAuth(client *Client, msg *protocol.Message, remoteAddr st
 		return
 	}
 
-	// Authentication successful
 	client.DeviceID = payload.DeviceID
 	client.DeviceName = payload.DeviceName
 	client.Authed = true
 
 	s.mu.Lock()
+	if existing, ok := s.clients[payload.DeviceID]; ok && existing != client {
+		existing.Conn.Close()
+	}
 	s.clients[payload.DeviceID] = client
 	s.mu.Unlock()
 
-	// Update last seen
 	s.store.UpdateLastSeen(payload.DeviceID, remoteAddr, s.cfg.Port)
 
 	resp, _ := protocol.NewMessage(protocol.TypeAuthResp, protocol.AuthRespPayload{
@@ -322,7 +339,6 @@ func (s *Server) handleAuth(client *Client, msg *protocol.Message, remoteAddr st
 	log.Printf("[Server] Device authenticated: %s (%s)", payload.DeviceName, payload.DeviceID[:8])
 }
 
-// handlePairRequest processes a new device pairing request
 func (s *Server) handlePairRequest(client *Client, msg *protocol.Message, remoteAddr string) {
 	var payload protocol.PairReqPayload
 	if err := msg.ParseData(&payload); err != nil {
@@ -344,14 +360,12 @@ func (s *Server) handlePairRequest(client *Client, msg *protocol.Message, remote
 		return
 	}
 
-	// Generate auth token
 	authToken, err := store.GenerateAuthToken()
 	if err != nil {
 		s.sendError(client, "Internal error generating auth token")
 		return
 	}
 
-	// Store the paired device
 	device := &store.PairedDevice{
 		DeviceID:   payload.DeviceID,
 		DeviceName: payload.DeviceName,
@@ -366,18 +380,19 @@ func (s *Server) handlePairRequest(client *Client, msg *protocol.Message, remote
 		return
 	}
 
-	// Disable pairing mode
 	s.mu.Lock()
 	s.pairingActive = false
 	s.pairingCode = ""
 	s.mu.Unlock()
 
-	// Mark client as authenticated
 	client.DeviceID = payload.DeviceID
 	client.DeviceName = payload.DeviceName
 	client.Authed = true
 
 	s.mu.Lock()
+	if existing, ok := s.clients[payload.DeviceID]; ok && existing != client {
+		existing.Conn.Close()
+	}
 	s.clients[payload.DeviceID] = client
 	s.mu.Unlock()
 
@@ -393,7 +408,6 @@ func (s *Server) handlePairRequest(client *Client, msg *protocol.Message, remote
 	log.Printf("[Server] Device paired: %s (%s)", payload.DeviceName, payload.DeviceID[:8])
 }
 
-// handlePairHTTP allows pairing via a standard POST request (bypass hotspot WS blocks)
 func (s *Server) handlePairHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -449,7 +463,6 @@ func (s *Server) handlePairHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Server] Device paired via HTTP: %s (%s)", payload.DeviceName, payload.DeviceID[:8])
 }
 
-// handleText processes incoming text from a phone
 func (s *Server) handleText(client *Client, msg *protocol.Message) {
 	if !client.Authed {
 		s.sendError(client, "Not authenticated")
@@ -462,9 +475,14 @@ func (s *Server) handleText(client *Client, msg *protocol.Message) {
 		return
 	}
 
-	log.Printf("[Text] From %s: %s", client.DeviceName, payload.Content)
+	lines := strings.Split(payload.Content, "\n")
+	output := fmt.Sprintf("\n  ╭─── 💬 Text from %s ───\n", client.DeviceName)
+	for _, line := range lines {
+		output += fmt.Sprintf("  │ %s\n", line)
+	}
+	output += "  ╰────────────────────────────────────────"
+	log.Print(output)
 
-	// Send ack
 	ack, _ := protocol.NewMessage(protocol.TypeAck, protocol.AckPayload{
 		MessageID: msg.ID,
 		Status:    "ok",
@@ -472,7 +490,6 @@ func (s *Server) handleText(client *Client, msg *protocol.Message) {
 	s.sendMessage(client, ack)
 }
 
-// handleClipboard processes clipboard sync from phone
 func (s *Server) handleClipboard(client *Client, msg *protocol.Message) {
 	if !client.Authed {
 		s.sendError(client, "Not authenticated")
@@ -485,17 +502,21 @@ func (s *Server) handleClipboard(client *Client, msg *protocol.Message) {
 		return
 	}
 
-	// Set clipboard locally
 	s.clipMonitor.SetContent(payload.Content)
 	if err := clipboard.Write(payload.Content); err != nil {
 		log.Printf("[Clipboard] Failed to write: %v", err)
 		return
 	}
 
-	log.Printf("[Clipboard] Synced from %s: %s", client.DeviceName, truncate(payload.Content, 50))
+	lines := strings.Split(payload.Content, "\n")
+	output := "\n  ╭─── 📋 Clipboard Synced ───\n"
+	for _, line := range lines {
+		output += fmt.Sprintf("  │ %s\n", line)
+	}
+	output += "  ╰────────────────────────────────────────"
+	log.Print(output)
 }
 
-// handleFileStart begins receiving a file from a phone
 func (s *Server) handleFileStart(client *Client, msg *protocol.Message) {
 	if !client.Authed {
 		s.sendError(client, "Not authenticated")
@@ -508,10 +529,7 @@ func (s *Server) handleFileStart(client *Client, msg *protocol.Message) {
 		return
 	}
 
-	// Create receive file
 	destPath := filepath.Join(s.cfg.ReceiveDir, payload.Filename)
-
-	// Ensure unique filename
 	destPath = ensureUniquePath(destPath)
 
 	f, err := os.Create(destPath)
@@ -521,14 +539,17 @@ func (s *Server) handleFileStart(client *Client, msg *protocol.Message) {
 	}
 
 	s.transfersMu.Lock()
-	s.transfers[payload.TransferID] = &FileTransfer{
+	transfer := &FileTransfer{
 		TransferID: payload.TransferID,
 		Filename:   filepath.Base(destPath),
 		FileSize:   payload.FileSize,
 		ChunkSize:  payload.ChunkSize,
 		File:       f,
+		Hasher:     sha256.New(),
 		StartTime:  time.Now(),
 	}
+	s.transfers[payload.TransferID] = transfer
+	client.ActiveTransfer = transfer
 	s.transfersMu.Unlock()
 
 	log.Printf("[File] Starting receive: %s (%d bytes)", payload.Filename, payload.FileSize)
@@ -540,7 +561,96 @@ func (s *Server) handleFileStart(client *Client, msg *protocol.Message) {
 	s.sendMessage(client, ack)
 }
 
-// handleFileChunk processes a chunk of incoming file data
+func (s *Server) handleFileMeta(client *Client, msg *protocol.Message) {
+	if !client.Authed {
+		s.sendError(client, "Not authenticated")
+		return
+	}
+
+	var payload protocol.FileMetaPayload
+	if err := msg.ParseData(&payload); err != nil {
+		s.sendError(client, "Invalid file meta payload")
+		return
+	}
+
+	destPath := filepath.Join(s.cfg.ReceiveDir, payload.Name)
+	destPath = ensureUniquePath(destPath)
+
+	f, err := os.Create(destPath)
+	if err != nil {
+		s.sendError(client, fmt.Sprintf("Failed to create file: %v", err))
+		return
+	}
+
+	s.transfersMu.Lock()
+	transfer := &FileTransfer{
+		TransferID: payload.TransferID,
+		Filename:   filepath.Base(destPath),
+		FileSize:   payload.Size,
+		File:       f,
+		Hasher:     sha256.New(),
+		StartTime:  time.Now(),
+	}
+	if payload.TransferID != "" {
+		s.transfers[payload.TransferID] = transfer
+	}
+	client.ActiveTransfer = transfer
+	s.transfersMu.Unlock()
+
+	log.Printf("[File] Starting binary receive: %s (%d bytes)", payload.Name, payload.Size)
+
+	ack, _ := protocol.NewMessage(protocol.TypeAck, protocol.AckPayload{
+		MessageID: msg.ID,
+		Status:    "ok",
+	})
+	s.sendMessage(client, ack)
+}
+
+func (s *Server) handleBinaryChunk(client *Client, data []byte) {
+	if !client.Authed || client.ActiveTransfer == nil {
+		return
+	}
+
+	transfer := client.ActiveTransfer
+	if _, err := transfer.File.Write(data); err != nil {
+		log.Printf("[File] Write error: %v", err)
+		return
+	}
+
+	transfer.Hasher.Write(data)
+	transfer.Received++
+	transfer.TotalBytes += int64(len(data))
+
+	ackMsg, _ := protocol.NewMessage(protocol.TypeAck, protocol.AckPayload{
+		TransferID: transfer.TransferID,
+		Chunk:      transfer.Received,
+	})
+	s.sendMessage(client, ackMsg)
+}
+
+func (s *Server) handleAck(client *Client, msg *protocol.Message) {
+	if !client.Authed {
+		return
+	}
+
+	var payload protocol.AckPayload
+	if err := msg.ParseData(&payload); err != nil {
+		return
+	}
+
+	if payload.TransferID != "" {
+		s.ackMu.Lock()
+		ch, ok := s.ackCallbacks[payload.TransferID]
+		s.ackMu.Unlock()
+		if ok {
+			select {
+			case ch <- payload.Chunk:
+			default:
+			}
+		}
+	}
+}
+
 func (s *Server) handleFileChunk(client *Client, msg *protocol.Message) {
 	if !client.Authed {
 		return
@@ -570,10 +680,10 @@ func (s *Server) handleFileChunk(client *Client, msg *protocol.Message) {
 		return
 	}
 
+	transfer.Hasher.Write(data)
 	transfer.Received++
 }
 
-// handleFileEnd completes a file transfer
 func (s *Server) handleFileEnd(client *Client, msg *protocol.Message) {
 	if !client.Authed {
 		return
@@ -586,25 +696,33 @@ func (s *Server) handleFileEnd(client *Client, msg *protocol.Message) {
 
 	s.transfersMu.Lock()
 	transfer, ok := s.transfers[payload.TransferID]
-	if ok {
-		delete(s.transfers, payload.TransferID)
+	if !ok {
+		transfer = client.ActiveTransfer
+	}
+
+	if transfer != nil {
+		delete(s.transfers, transfer.TransferID)
+		client.ActiveTransfer = nil
 	}
 	s.transfersMu.Unlock()
 
-	if !ok {
+	if transfer == nil {
 		return
 	}
 
 	transfer.File.Close()
 
 	elapsed := time.Since(transfer.StartTime)
-	log.Printf("[File] Received: %s (%d chunks in %v)", transfer.Filename, transfer.Received, elapsed.Round(time.Millisecond))
+	log.Printf("[File] Received: %s (%d bytes in %d chunks, %v)", transfer.Filename, transfer.TotalBytes, transfer.Received, elapsed.Round(time.Millisecond))
 
-	// Verify checksum if provided
+	if transfer.FileSize > 0 && transfer.TotalBytes != transfer.FileSize {
+		log.Printf("[File] WARNING: Size mismatch: %d received vs %d expected", transfer.TotalBytes, transfer.FileSize)
+	}
+
 	if payload.Checksum != "" {
-		destPath := filepath.Join(s.cfg.ReceiveDir, transfer.Filename)
-		if ok := verifyChecksum(destPath, payload.Checksum); !ok {
-			log.Printf("[File] WARNING: Checksum mismatch for %s", transfer.Filename)
+		actualChecksum := fmt.Sprintf("%x", transfer.Hasher.Sum(nil))
+		if actualChecksum != payload.Checksum {
+			log.Printf("[File] WARNING: Checksum mismatch for %s. Expected %s, got %s", transfer.Filename, payload.Checksum, actualChecksum)
 		}
 	}
 
@@ -615,7 +733,6 @@ func (s *Server) handleFileEnd(client *Client, msg *protocol.Message) {
 	s.sendMessage(client, ack)
 }
 
-// SendText sends a text message to a connected device
 func (s *Server) SendText(deviceID, text string) error {
 	client, err := s.getClient(deviceID)
 	if err != nil {
@@ -628,7 +745,6 @@ func (s *Server) SendText(deviceID, text string) error {
 	return s.sendMessage(client, msg)
 }
 
-// SendClipboard sends clipboard content to a connected device
 func (s *Server) SendClipboard(deviceID, content string) error {
 	client, err := s.getClient(deviceID)
 	if err != nil {
@@ -642,14 +758,12 @@ func (s *Server) SendClipboard(deviceID, content string) error {
 	return s.sendMessage(client, msg)
 }
 
-// SendFile sends a file to a connected device
 func (s *Server) SendFile(deviceID, filePath string) error {
 	client, err := s.getClient(deviceID)
 	if err != nil {
 		return err
 	}
 
-	// Open file
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("open file: %w", err)
@@ -663,21 +777,44 @@ func (s *Server) SendFile(deviceID, filePath string) error {
 
 	transferID, _ := store.GenerateDeviceID()
 
-	// Send FILE_START
-	startMsg, _ := protocol.NewMessage(protocol.TypeFileStart, protocol.FileStartPayload{
-		Filename:   stat.Name(),
-		FileSize:   stat.Size(),
-		ChunkSize:  config.ChunkSize,
+	metaMsg, _ := protocol.NewMessage(protocol.TypeFileMeta, protocol.FileMetaPayload{
+		Name:       stat.Name(),
+		Size:       stat.Size(),
 		TransferID: transferID,
 	})
-	if err := s.sendMessage(client, startMsg); err != nil {
-		return fmt.Errorf("send file start: %w", err)
+	if err := s.sendMessage(client, metaMsg); err != nil {
+		return fmt.Errorf("send file meta: %w", err)
 	}
 
-	// Stream chunks
 	buf := make([]byte, config.ChunkSize)
 	chunkIndex := 0
 	hasher := sha256.New()
+
+	ackChan := make(chan int, 50)
+	s.ackMu.Lock()
+	s.ackCallbacks[transferID] = ackChan
+	s.ackMu.Unlock()
+
+	defer func() {
+		s.ackMu.Lock()
+		delete(s.ackCallbacks, transferID)
+		s.ackMu.Unlock()
+		close(ackChan)
+	}()
+
+	// Wait for Mobile to initialize the file and send an ACK for readiness (chunk 0)
+	ready := false
+	for !ready {
+		select {
+		case ackChunk := <-ackChan:
+			if ackChunk == 0 {
+				ready = true
+			}
+		case <-time.After(10 * time.Second):
+			log.Printf("[File] ⚠️ Readiness ACK timeout for %s", stat.Name())
+			return fmt.Errorf("readiness ACK timeout")
+		}
+	}
 
 	for {
 		n, err := f.Read(buf)
@@ -685,19 +822,27 @@ func (s *Server) SendFile(deviceID, filePath string) error {
 			data := buf[:n]
 			hasher.Write(data)
 
-			chunkMsg, _ := protocol.NewMessage(protocol.TypeFileChunk, protocol.FileChunkPayload{
-				TransferID: transferID,
-				Index:      chunkIndex,
-				Data:       base64.StdEncoding.EncodeToString(data),
-				Size:       n,
-			})
-			if err := s.sendMessage(client, chunkMsg); err != nil {
-				return fmt.Errorf("send chunk %d: %w", chunkIndex, err)
+			client.mu.Lock()
+			err = client.Conn.WriteMessage(websocket.BinaryMessage, data)
+			client.mu.Unlock()
+			if err != nil {
+				return fmt.Errorf("send binary chunk %d: %w", chunkIndex, err)
 			}
 			chunkIndex++
 
-			// Small delay to prevent overwhelming the connection
-			time.Sleep(5 * time.Millisecond)
+			// Wait for ACK
+			matched := false
+			for !matched {
+				select {
+				case ackChunk := <-ackChan:
+					if ackChunk == chunkIndex {
+						matched = true
+					}
+				case <-time.After(8 * time.Second):
+					log.Printf("[File] ⚠️ ACK timeout for chunk #%d", chunkIndex)
+					return fmt.Errorf("ACK timeout for chunk #%d", chunkIndex)
+				}
+			}
 		}
 		if err == io.EOF {
 			break
@@ -707,7 +852,6 @@ func (s *Server) SendFile(deviceID, filePath string) error {
 		}
 	}
 
-	// Send FILE_END
 	checksum := fmt.Sprintf("%x", hasher.Sum(nil))
 	endMsg, _ := protocol.NewMessage(protocol.TypeFileEnd, protocol.FileEndPayload{
 		TransferID:  transferID,
@@ -718,11 +862,10 @@ func (s *Server) SendFile(deviceID, filePath string) error {
 		return fmt.Errorf("send file end: %w", err)
 	}
 
-	log.Printf("[File] Sent: %s (%d chunks, %d bytes)", stat.Name(), chunkIndex, stat.Size())
+	log.Printf("[File] Sent binary: %s (%d chunks, %d bytes)", stat.Name(), chunkIndex, stat.Size())
 	return nil
 }
 
-// broadcastClipboard sends clipboard content to all connected devices
 func (s *Server) broadcastClipboard(content string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -739,7 +882,6 @@ func (s *Server) broadcastClipboard(content string) {
 	}
 }
 
-// GetConnectedDevices returns the list of connected device IDs
 func (s *Server) GetConnectedDevices() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -752,7 +894,6 @@ func (s *Server) GetConnectedDevices() []string {
 	return ids
 }
 
-// pingLoop sends periodic pings to all connected clients
 func (s *Server) pingLoop() {
 	ticker := time.NewTicker(time.Duration(config.PingInterval) * time.Second)
 	defer ticker.Stop()
@@ -774,7 +915,6 @@ func (s *Server) pingLoop() {
 	}
 }
 
-// sendMessage sends a message to a client (thread-safe)
 func (s *Server) sendMessage(client *Client, msg *protocol.Message) error {
 	data, err := msg.Encode()
 	if err != nil {
@@ -785,7 +925,6 @@ func (s *Server) sendMessage(client *Client, msg *protocol.Message) error {
 	return client.Conn.WriteMessage(websocket.TextMessage, data)
 }
 
-// sendError sends an error message to a client
 func (s *Server) sendError(client *Client, errMsg string) {
 	msg, _ := protocol.NewMessage(protocol.TypeError, protocol.ErrorPayload{
 		Code:    400,
@@ -794,12 +933,10 @@ func (s *Server) sendError(client *Client, errMsg string) {
 	s.sendMessage(client, msg)
 }
 
-// getClient returns a connected, authenticated client
 func (s *Server) getClient(deviceID string) (*Client, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// If deviceID is empty, return the first connected device
 	if deviceID == "" {
 		for _, c := range s.clients {
 			if c.Authed {
@@ -819,24 +956,20 @@ func (s *Server) getClient(deviceID string) (*Client, error) {
 	return client, nil
 }
 
-// handleHealth returns server health status
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
-// handleInfo returns server information
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	connectedCount := len(s.clients)
 	s.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"name":"%s","id":"%s","port":%d,"connected":%d}`,
+	fmt.Fprintf(w, `{"device_name":"%s","device_id":"%s","version":"1.0.0","port":%d,"connected":%d}`,
 		s.cfg.DeviceName, s.cfg.DeviceID, s.cfg.Port, connectedCount)
 }
-
-// --- Utilities ---
 
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {

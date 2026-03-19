@@ -1,0 +1,1668 @@
+diff --git a/issues/stuck.md b/issues/stuck.md
+deleted file mode 100644
+index ffa9d19..0000000
+--- a/issues/stuck.md
++++ /dev/null
+@@ -1,2 +0,0 @@
+-\*from Storage button not working
+-\*files coming to my pc arent openable. They all are corrupt data.
+diff --git a/pc-node/src/index.js b/pc-node/src/index.js
+index d777429..e41680d 100644
+--- a/pc-node/src/index.js
++++ b/pc-node/src/index.js
+@@ -1,5 +1,6 @@
+ const readline = require("readline");
+ const path = require("path");
++const fs = require("fs-extra");
+ const { Config } = require("./internal/config");
+ const Store = require("./internal/store");
+ const Server = require("./internal/server");
+@@ -18,6 +19,57 @@ const banner = `
+   v1.0.0
+ `;
+ 
++/**
++ * First-time setup: ask user where to save received files.
++ * Uses a temporary readline interface so the main REPL isn't active yet.
++ */
++async function firstRunSetup(cfg) {
++  return new Promise((resolve) => {
++    const setupRl = readline.createInterface({
++      input: process.stdin,
++      output: process.stdout,
++    });
++
++    console.log(`
++  ╔═══════════════════════════════════════════════════════╗
++  ║           📂 First-Time Setup — File Storage          ║
++  ╠═══════════════════════════════════════════════════════╣
++  ║                                                       ║
++  ║  mcSync needs a directory to save files received      ║
++  ║  from your phone.                                     ║
++  ║                                                       ║
++  ║  Current default:                                     ║
++  ║    ${cfg.receive_dir.padEnd(47)}  ║
++  ║                                                       ║
++  ║  Press ENTER to keep the default, or type a new       ║
++  ║  absolute path (e.g. /home/user/Downloads/mcSync).    ║
++  ╚═══════════════════════════════════════════════════════╝
++`);
++
++    setupRl.question("  Save received files to: ", async (answer) => {
++      const input = answer.trim();
++      if (input) {
++        const resolvedPath = path.resolve(input);
++        try {
++          await fs.ensureDir(resolvedPath);
++          cfg.receive_dir = resolvedPath;
++          console.log(`\n  ✓ Receive directory set to: ${resolvedPath}`);
++        } catch (err) {
++          console.error(`\n  ✗ Could not create directory: ${err.message}`);
++          console.log(`  → Keeping default: ${cfg.receive_dir}`);
++        }
++      } else {
++        console.log(`\n  ✓ Using default: ${cfg.receive_dir}`);
++      }
++
++      cfg.first_run = false;
++      await cfg.save();
++      setupRl.close();
++      resolve();
++    });
++  });
++}
++
+ async function main() {
+   process.stdout.write(banner);
+ 
+@@ -27,11 +79,59 @@ async function main() {
+     await cfg.save();
+   }
+ 
++  // ─── First-run: ask where to save received files ───────────
++  if (cfg.first_run) {
++    await firstRunSetup(cfg);
++  }
++
+   const store = await Store.create(cfg.data_dir);
+-  const server = new Server(cfg, store);
++
++  // Initialize REPL early to handle logging
++  const rl = readline.createInterface({
++    input: process.stdin,
++    output: process.stdout,
++    prompt: "mcSync-node> ",
++  });
++
++  let isClosing = false;
++
++  const logger = {
++    info: (msg) => {
++      if (process.stdout.isTTY) {
++        readline.cursorTo(process.stdout, 0);
++        readline.clearLine(process.stdout, 0);
++      }
++      console.log(msg);
++      if (!isClosing) rl.prompt(true);
++    },
++    warn: (msg) => {
++      if (process.stdout.isTTY) {
++        readline.cursorTo(process.stdout, 0);
++        readline.clearLine(process.stdout, 0);
++      }
++      console.warn(msg);
++      if (!isClosing) rl.prompt(true);
++    },
++    error: (msg) => {
++      if (process.stdout.isTTY) {
++        readline.cursorTo(process.stdout, 0);
++        readline.clearLine(process.stdout, 0);
++      }
++      console.error(msg);
++      if (!isClosing) rl.prompt(true);
++    },
++  };
++
++  const server = new Server(cfg, store, logger);
++
++  // Note: DiscoveryService is currently created inside server.start in current implementation,
++  // but let's check if we can pass logger through.
++  // Looking at server.js: this.discovery = new DiscoveryService(this.cfg.port, this.cfg.device_name);
++  // I should update server.js to pass this.logger to DiscoveryService.
++
+   await server.start();
+ 
+-  const clip = new ClipboardMonitor();
++  const clip = new ClipboardMonitor(1500, logger);
+   if (cfg.clipboard_sync) {
+     await clip.start();
+     clip.on("change", (content) => {
+@@ -46,16 +146,10 @@ async function main() {
+   }
+ 
+   const localIP = DiscoveryService.getLocalIP();
+-  process.stdout.write(`\n  ✓ Server running on ${localIP}:${cfg.port}\n`);
+-  process.stdout.write(`  ✓ Device: ${cfg.device_name}\n`);
+-  process.stdout.write(`  ✓ Receive directory: ${cfg.receive_dir}\n\n`);
+-  process.stdout.write(`  Type 'help' for available commands.\n\n`);
+-
+-  const rl = readline.createInterface({
+-    input: process.stdin,
+-    output: process.stdout,
+-    prompt: "mcSync-node> ",
+-  });
++  logger.info(`\n  ✓ Server running on ${localIP}:${cfg.port}`);
++  logger.info(`  ✓ Device: ${cfg.device_name}`);
++  logger.info(`  ✓ Receive directory: ${cfg.receive_dir}\n`);
++  logger.info(`  Type 'help' for available commands.\n`);
+ 
+   rl.prompt();
+ 
+@@ -74,18 +168,18 @@ async function main() {
+       switch (command) {
+         case "pair":
+         case "p":
+-          await cmdPair(server, cfg);
++          await cmdPair(server, cfg, logger);
+           break;
+         case "send-text":
+         case "st":
+         case "text": {
+           if (args.length === 0) {
+-            process.stdout.write("  Usage: send-text <message>\n");
++            logger.info("  Usage: send-text <message>");
+           } else {
+             const text = args.join(" ");
+             await server.sendText(null, text);
+-            process.stdout.write(
+-              `  ✓ Sent: ${text.length > 60 ? text.slice(0, 60) + "..." : text}\n`,
++            logger.info(
++              `  ✓ Sent: ${text.length > 60 ? text.slice(0, 60) + "..." : text}`,
+             );
+           }
+           break;
+@@ -94,11 +188,11 @@ async function main() {
+         case "sf":
+         case "file": {
+           if (args.length === 0) {
+-            process.stdout.write("  Usage: send-file <filepath>\n");
++            logger.info("  Usage: send-file <filepath>");
+           } else {
+             const filePath = path.resolve(args[0]);
+             await server.sendFile(null, filePath);
+-            process.stdout.write(`  ✓ File sent: ${path.basename(filePath)}\n`);
++            logger.info(`  ✓ File sent: ${path.basename(filePath)}`);
+           }
+           break;
+         }
+@@ -107,33 +201,69 @@ async function main() {
+         case "clip": {
+           const content = await clip.read();
+           if (!content) {
+-            process.stdout.write("  ✗ Clipboard is empty.\n");
++            logger.info("  ✗ Clipboard is empty.");
+           } else {
+             await server.sendClipboard(null, content);
+-            process.stdout.write(
+-              `  ✓ Clipboard sent: ${content.length > 60 ? content.slice(0, 60) + "..." : content}\n`,
++            logger.info(
++              `  ✓ Clipboard sent: ${content.length > 60 ? content.slice(0, 60) + "..." : content}`,
+             );
+           }
+           break;
+         }
+         case "devices":
+         case "ls":
+-          cmdDevices(store);
++          cmdDevices(store, logger);
+           break;
+         case "status":
+-          cmdStatus(cfg, server);
++          cmdStatus(cfg, server, logger);
+           break;
+         case "connected":
+-          cmdConnected(server);
++          cmdConnected(server, logger);
+           break;
++        case "rename":
++        case "rn": {
++          if (args.length === 0) {
++            logger.info(`  Current name: ${cfg.device_name}`);
++            logger.info(`  Usage: rename <new_name>`);
++          } else {
++            const newName = args.join(" ");
++            cfg.device_name = newName;
++            await cfg.save();
++            if (server.discovery) {
++              server.discovery.deviceName = newName;
++            }
++            logger.info(`  ✓ Device name changed to: ${newName}`);
++          }
++          break;
++        }
++        case "set-dir":
++        case "sd":
++        case "savedir": {
++          if (args.length === 0) {
++            logger.info(`  Current receive directory: ${cfg.receive_dir}`);
++            logger.info(`  Usage: set-dir <path>`);
++          } else {
++            const newDir = path.resolve(args.join(" "));
++            try {
++              await fs.ensureDir(newDir);
++              cfg.receive_dir = newDir;
++              await cfg.save();
++              logger.info(`  ✓ Receive directory changed to: ${newDir}`);
++            } catch (err) {
++              logger.info(`  ✗ Failed: ${err.message}`);
++            }
++          }
++          break;
++        }
+         case "help":
+         case "h":
+         case "?":
+-          cmdHelp();
++          cmdHelp(logger);
+           break;
+         case "clear":
+         case "cls":
+           console.clear();
++          rl.prompt();
+           break;
+         case "quit":
+         case "exit":
+@@ -141,18 +271,19 @@ async function main() {
+           rl.close();
+           return;
+         default:
+-          process.stdout.write(
+-            `  Unknown command: ${command} — type 'help' for the list.\n`,
++          logger.info(
++            `  Unknown command: ${command} — type 'help' for the list.`,
+           );
+       }
+     } catch (err) {
+-      process.stdout.write(`  ✗ Error: ${err.message}\n`);
++      logger.info(`  ✗ Error: ${err.message}`);
+     }
+ 
+     rl.prompt();
+   });
+ 
+   rl.on("close", () => {
++    isClosing = true;
+     process.stdout.write("\n  Shutting down...\n");
+     server.stop();
+     clip.stop();
+@@ -160,30 +291,32 @@ async function main() {
+   });
+ }
+ 
+-function cmdHelp() {
+-  process.stdout.write(`
+-  ╔═══════════════════════════════════════════════════╗
+-  ║              mcSync Commands (Node.js)            ║
+-  ╠════════════╦══════════════════════════════════════╣
+-  ║ pair       ║ Generate a pairing code              ║
+-  ║ text <msg> ║ Send text to phone                   ║
+-  ║ file <path>║ Send a file to phone                 ║
+-  ║ clip       ║ Send PC clipboard to phone           ║
+-  ║ devices    ║ List paired devices                  ║
+-  ║ connected  ║ Show currently connected devices     ║
+-  ║ status     ║ Show server status                   ║
+-  ║ clear      ║ Clear the screen                     ║
+-  ║ quit       ║ Stop the server and exit             ║
+-  ╚════════════╩══════════════════════════════════════╝
+-
+-  Aliases: pair(p) text(st) file(sf) clip(cb) devices(ls) quit(q,exit)\n\n`);
++function cmdHelp(logger) {
++  logger.info(`
++  ╔════════════════════════════════════════════════════════╗
++  ║               mcSync Commands (Node.js)               ║
++  ╠═══════════════╦════════════════════════════════════════╣
++  ║ pair          ║ Generate a pairing code               ║
++  ║ text <msg>    ║ Send text to phone                    ║
++  ║ file <path>   ║ Send a file to phone                  ║
++  ║ clip          ║ Send PC clipboard to phone            ║
++  ║ devices       ║ List paired devices                   ║
++  ║ connected     ║ Show currently connected devices      ║
++  ║ rename <name> ║ Change PC device name                 ║
++  ║ set-dir <path>║ Change where received files are saved ║
++  ║ status        ║ Show server status                    ║
++  ║ clear         ║ Clear the screen                      ║
++  ║ quit          ║ Stop the server and exit              ║
++  ╚═══════════════╩════════════════════════════════════════╝
++
++  Aliases: pair(p) text(st) file(sf) clip(cb) devices(ls) rename(rn) set-dir(sd) quit(q,exit)\n`);
+ }
+ 
+-async function cmdPair(server, cfg) {
++async function cmdPair(server, cfg, logger) {
+   const code = await server.startPairing();
+   const localIP = DiscoveryService.getLocalIP();
+ 
+-  process.stdout.write(`
++  logger.info(`
+   ╔═══════════════════════════════════════╗
+   ║         mcSync Device Pairing         ║
+   ╠═══════════════════════════════════════╣
+@@ -196,55 +329,52 @@ async function cmdPair(server, cfg) {
+   ║  and enter this code to pair.         ║
+   ║                                       ║
+   ║  Code expires in 5 minutes.           ║
+-  ╚═══════════════════════════════════════╝\n\n`);
++  ╚═══════════════════════════════════════╝\n`);
+ }
+ 
+-function cmdDevices(store) {
++function cmdDevices(store, logger) {
+   const devices = store.listDevices();
+   if (devices.length === 0) {
+-    process.stdout.write("  No paired devices. Type 'pair' to add one.\n");
++    logger.info("  No paired devices. Type 'pair' to add one.");
+     return;
+   }
+ 
+-  process.stdout.write("\n  Paired Devices:\n");
+-  process.stdout.write("  ───────────────────────────────────────\n");
++  let output = "\n  Paired Devices:\n";
++  output += "  ───────────────────────────────────────\n";
+   devices.forEach((d) => {
+-    process.stdout.write(`  • ${d.device_name}\n`);
+-    process.stdout.write(`    ID:        ${d.device_id.slice(0, 16)}...\n`);
+-    process.stdout.write(
+-      `    Paired:    ${new Date(d.paired_at).toLocaleString()}\n`,
+-    );
+-    process.stdout.write(
+-      `    Last Seen: ${new Date(d.last_seen).toLocaleString()}\n\n`,
+-    );
++    output += `  • ${d.device_name}\n`;
++    output += `    ID:        ${d.device_id.slice(0, 16)}...\n`;
++    output += `    Paired:    ${new Date(d.paired_at).toLocaleString()}\n`;
++    output += `    Last Seen: ${new Date(d.last_seen).toLocaleString()}\n\n`;
+   });
++  logger.info(output);
+ }
+ 
+-function cmdConnected(server) {
++function cmdConnected(server, logger) {
+   const devs = server.getConnectedDevices();
+   if (devs.length === 0) {
+-    process.stdout.write("  No devices currently connected.\n");
++    logger.info("  No devices currently connected.");
+     return;
+   }
+ 
+-  process.stdout.write("\n  Connected Devices:\n");
++  let output = "\n  Connected Devices:\n";
+   devs.forEach((id, i) => {
+-    process.stdout.write(`  ${i + 1}. ${id}\n`);
++    output += `  ${i + 1}. ${id}\n`;
+   });
+-  process.stdout.write("\n");
++  logger.info(output);
+ }
+ 
+-function cmdStatus(cfg, server) {
++function cmdStatus(cfg, server, logger) {
+   const localIP = DiscoveryService.getLocalIP();
+   const devs = server.getConnectedDevices();
+-  process.stdout.write(`
++  logger.info(`
+   mcSync Status (Node.js)
+   ─────────────────────────────
+   Device:     ${cfg.device_name}
+   Local IP:   ${localIP}
+   Port:       ${cfg.port}
+   Data Dir:   ${cfg.data_dir}
+-  Connected:  ${devs.length} device(s)\n\n`);
++  Connected:  ${devs.length} device(s)\n`);
+ }
+ 
+ main().catch(console.error);
+diff --git a/pc-node/src/internal/clipboard.js b/pc-node/src/internal/clipboard.js
+index 89c528a..ced208c 100644
+--- a/pc-node/src/internal/clipboard.js
++++ b/pc-node/src/internal/clipboard.js
+@@ -2,23 +2,28 @@ const clipboardy = require("clipboardy");
+ const EventEmitter = require("events");
+ 
+ class ClipboardMonitor extends EventEmitter {
+-  constructor(interval = 1500) {
++  constructor(interval = 1500, logger = null) {
+     super();
+     this.interval = interval;
+     this.lastContent = "";
+     this.timer = null;
++    this.logger = logger || {
++      info: (...args) => console.log(...args),
++      warn: (...args) => console.warn(...args),
++      error: (...args) => console.error(...args),
++    };
+   }
+ 
+   async start() {
+     // Polling disabled to prevent system lag. Clipboard sync is now on-demand.
+-    console.log(`[Clipboard] Monitor available (On-Demand Mode)`);
++    this.logger.info(`[Clipboard] Monitor available (On-Demand Mode)`);
+   }
+ 
+   stop() {
+     if (this.timer) {
+       clearInterval(this.timer);
+       this.timer = null;
+-      console.log(`[Clipboard] Monitor stopped`);
++      this.logger.info(`[Clipboard] Monitor stopped`);
+     }
+   }
+ 
+@@ -35,7 +40,7 @@ class ClipboardMonitor extends EventEmitter {
+       }
+       await writeFn(content);
+     } catch (err) {
+-      console.error(`[Clipboard] Failed to write: ${err.message}`);
++      this.logger.error(`[Clipboard] Failed to write: ${err.message}`);
+     }
+   }
+ 
+diff --git a/pc-node/src/internal/config.js b/pc-node/src/internal/config.js
+index 3bedc1e..1f9c441 100644
+--- a/pc-node/src/internal/config.js
++++ b/pc-node/src/internal/config.js
+@@ -5,9 +5,9 @@ const fs = require("fs-extra");
+ const AppName = "mcsync";
+ const DefaultPort = 9090;
+ const ServiceType = "_mcsync._tcp";
+-const ChunkSize = 60 * 1024; // 60KB (multiple of 3 for base64 safety)
++const ChunkSize = 64 * 1024; // 64KB chunks for file transfer
+ const PingInterval = 15; // seconds
+-const MaxMessageSize = 10 * 1024 * 1024; // 10MB (raised for better handling)
++const MaxMessageSize = 10 * 1024 * 1024; // 10MB max WebSocket frame
+ 
+ class Config {
+   constructor() {
+@@ -19,6 +19,7 @@ class Config {
+     this.data_dir = path.join(homeDir, ".mcsync");
+     this.receive_dir = path.join(this.data_dir, "received");
+     this.clipboard_sync = true;
++    this.first_run = true; // true until user completes first-time setup
+   }
+ 
+   static async load() {
+diff --git a/pc-node/src/internal/discovery.js b/pc-node/src/internal/discovery.js
+index ff3382a..8f559b9 100644
+--- a/pc-node/src/internal/discovery.js
++++ b/pc-node/src/internal/discovery.js
+@@ -2,10 +2,15 @@ const mdns = require("multicast-dns")();
+ const os = require("os");
+ 
+ class DiscoveryService {
+-  constructor(port, deviceName) {
++  constructor(port, deviceName, logger = null) {
+     this.port = port;
+     this.deviceName = deviceName;
+     this.serviceType = "_mcsync._tcp.local";
++    this.logger = logger || {
++      info: (...args) => console.log(...args),
++      warn: (...args) => console.warn(...args),
++      error: (...args) => console.error(...args),
++    };
+   }
+ 
+   start() {
+@@ -15,7 +20,9 @@ class DiscoveryService {
+       }
+     });
+ 
+-    console.log(`[mDNS] Advertising ${this.serviceType} on port ${this.port}`);
++    this.logger.info(
++      `[mDNS] Advertising ${this.serviceType} on port ${this.port}`,
++    );
+   }
+ 
+   respond() {
+@@ -54,7 +61,7 @@ class DiscoveryService {
+ 
+   stop() {
+     mdns.destroy();
+-    console.log(`[mDNS] Service stopped`);
++    this.logger.info(`[mDNS] Service stopped`);
+   }
+ 
+   static getLocalIPs() {
+diff --git a/pc-node/src/internal/protocol.js b/pc-node/src/internal/protocol.js
+index 535ee05..e3edb64 100644
+--- a/pc-node/src/internal/protocol.js
++++ b/pc-node/src/internal/protocol.js
+@@ -3,6 +3,7 @@ const MessageTypes = {
+   AUTH_RESP: "AUTH_RESP",
+   TEXT: "TEXT",
+   FILE_START: "FILE_START",
++  FILE_META: "FILE_META",
+   FILE_CHUNK: "FILE_CHUNK",
+   FILE_END: "FILE_END",
+   CLIPBOARD: "CLIPBOARD",
+diff --git a/pc-node/src/internal/server.js b/pc-node/src/internal/server.js
+index 2c7b930..d283ffb 100644
+--- a/pc-node/src/internal/server.js
++++ b/pc-node/src/internal/server.js
+@@ -9,7 +9,7 @@ const DiscoveryService = require("./discovery");
+ const Store = require("./store");
+ 
+ class Server {
+-  constructor(cfg, store) {
++  constructor(cfg, store, logger = null) {
+     this.cfg = cfg;
+     this.store = store;
+     this.clients = new Map();
+@@ -17,6 +17,12 @@ class Server {
+     this.pairingActive = false;
+     this.transfers = new Map();
+ 
++    this.logger = logger || {
++      info: (...args) => console.log(...args),
++      warn: (...args) => console.warn(...args),
++      error: (...args) => console.error(...args),
++    };
++
+     this.app = express();
+     this.server = http.createServer(this.app);
+     this.wss = new WebSocket.Server({ server: this.server, path: "/ws" });
+@@ -29,13 +35,17 @@ class Server {
+   async start() {
+     await this.cfg.ensureDirs();
+ 
+-    this.discovery = new DiscoveryService(this.cfg.port, this.cfg.device_name);
++    this.discovery = new DiscoveryService(
++      this.cfg.port,
++      this.cfg.device_name,
++      this.logger,
++    );
+     this.discovery.start();
+ 
+     return new Promise((resolve) => {
+       this.server.listen(this.cfg.port, "0.0.0.0", () => {
+         const localIP = DiscoveryService.getLocalIP();
+-        console.log(
++        this.logger.info(
+           `[Server] Listening on 0.0.0.0:${this.cfg.port} (Accessible at ${localIP}:${this.cfg.port})`,
+         );
+         this.startPingLoop();
+@@ -50,7 +60,7 @@ class Server {
+ 
+     this.clients.forEach((client) => client.ws.close());
+     this.server.close();
+-    console.log(`[Server] Shutdown complete`);
++    this.logger.info(`[Server] Shutdown complete`);
+   }
+ 
+   setupRoutes() {
+@@ -63,6 +73,8 @@ class Server {
+         device_name: this.cfg.device_name,
+         device_id: this.cfg.device_id,
+         version: "1.0.0",
++        port: this.cfg.port,
++        connected: this.clients.size,
+       });
+     });
+ 
+@@ -97,7 +109,7 @@ class Server {
+         server_id: this.cfg.device_id,
+       });
+ 
+-      console.log(
++      this.logger.info(
+         `[Server] Device paired via HTTP: ${device.device_name} (${device.device_id.slice(0, 8)})`,
+       );
+     });
+@@ -106,23 +118,27 @@ class Server {
+   setupWebSocket() {
+     this.wss.on("connection", (ws, req) => {
+       const remoteAddr = req.socket.remoteAddress;
+-      console.log(`[Server] New connection from ${remoteAddr}`);
++      this.logger.info(`[Server] New connection from ${remoteAddr}`);
+ 
+       const client = { ws, authed: false, deviceID: "", deviceName: "" };
+ 
+-      ws.on("message", async (data) => {
++      ws.on("message", async (data, isBinary) => {
+         try {
++          if (isBinary) {
++            await this.handleBinaryChunk(client, data);
++            return;
++          }
+           const msg = Message.decode(data.toString());
+           await this.handleMessage(client, msg, remoteAddr);
+         } catch (err) {
+-          console.error(`[Server] Message error: ${err.message}`);
++          this.logger.error(`[Server] Message error: ${err.message}`);
+         }
+       });
+ 
+       ws.on("close", () => {
+         if (client.deviceID) {
+           this.clients.delete(client.deviceID);
+-          console.log(
++          this.logger.info(
+             `[Server] Device ${client.deviceName} (${client.deviceID.slice(0, 8)}) disconnected`,
+           );
+         }
+@@ -145,9 +161,11 @@ class Server {
+         this.emit("clipboard", msg.data.content);
+         break;
+       case MessageTypes.FILE_START:
+-        await this.handleFileStart(client, msg);
++      case MessageTypes.FILE_META:
++        await this.handleFileMeta(client, msg);
+         break;
+       case MessageTypes.FILE_CHUNK:
++        // Deprecated Base64 chunk handler — still here for legacy fallback but should be removed
+         await this.handleFileChunk(client, msg);
+         break;
+       case MessageTypes.FILE_END:
+@@ -159,7 +177,7 @@ class Server {
+       case MessageTypes.PONG:
+         break;
+       default:
+-        console.log(`[Server] Unknown message type: ${msg.type}`);
++        this.logger.info(`[Server] Unknown message type: ${msg.type}`);
+     }
+   }
+ 
+@@ -191,7 +209,7 @@ class Server {
+       }),
+     );
+ 
+-    console.log(
++    this.logger.info(
+       `[Server] Device authenticated: ${device_name} (${device_id.slice(0, 8)})`,
+     );
+   }
+@@ -238,14 +256,14 @@ class Server {
+       }),
+     );
+ 
+-    console.log(
++    this.logger.info(
+       `[Server] Device paired: ${device_name} (${device_id.slice(0, 8)})`,
+     );
+   }
+ 
+   handleText(client, msg) {
+     if (!client.authed) return;
+-    console.log(`[Text] From ${client.deviceName}: ${msg.data.content}`);
++    this.logger.info(`[Text] From ${client.deviceName}: ${msg.data.content}`);
+     this.emit("text", msg.data.content);
+     this.sendMessage(
+       client,
+@@ -253,10 +271,15 @@ class Server {
+     );
+   }
+ 
+-  async handleFileStart(client, msg) {
++  async handleFileMeta(client, msg) {
+     if (!client.authed) return;
+-    const { filename, file_size, transfer_id } = msg.data;
+-    const destPath = path.join(this.cfg.receive_dir, filename);
++    const { filename, file_size, transfer_id, name, size } = msg.data;
++    // Handle both protocol variants: start (legacy) and meta (new spec)
++    const fileName = filename || name;
++    const fileSize = file_size || size;
++    const transferId = transfer_id || "binary_transfer"; // spec doesn't strictly define transfer_id for meta
++
++    const destPath = path.join(this.cfg.receive_dir, fileName);
+ 
+     let finalPath = destPath;
+     let counter = 1;
+@@ -268,23 +291,53 @@ class Server {
+     }
+ 
+     const stream = fs.createWriteStream(finalPath);
+-    this.transfers.set(transfer_id, {
++    const transfer = {
++      transferId,
+       filename: path.basename(finalPath),
+       stream,
+       hash: crypto.createHash("sha256"),
+       received: 0,
++      totalBytes: 0,
++      expectedSize: fileSize,
+       start_time: Date.now(),
+-    });
++    };
++
++    // Store in global map for lookups by ID and on client for raw binary frames
++    this.transfers.set(transferId, transfer);
++    client.activeTransfer = transfer;
+ 
+-    console.log(
+-      `[File] Starting receive: ${path.basename(finalPath)} (${file_size} bytes)`,
++    this.logger.info(
++      `[File] Starting binary receive: ${path.basename(finalPath)} (${fileSize} bytes)`,
+     );
++    this.logger.info(`[File] 📂 Saving to: ${path.dirname(finalPath)}/`);
+     this.sendMessage(
+       client,
+       new Message(MessageTypes.ACK, { message_id: msg.id, status: "ok" }),
+     );
+   }
+ 
++  async handleBinaryChunk(client, data) {
++    if (!client.authed || !client.activeTransfer) {
++      this.logger.warn(`[File] Received binary frame but no active transfer`);
++      return;
++    }
++
++    const transfer = client.activeTransfer;
++    transfer.hash.update(data);
++    transfer.received++;
++    transfer.totalBytes += data.length;
++
++    // Await backpressure
++    const canContinue = transfer.stream.write(data);
++    if (!canContinue) {
++      await new Promise((resolve) => transfer.stream.once("drain", resolve));
++    }
++  }
++
++  async handleFileStart(client, msg) {
++    return this.handleFileMeta(client, msg);
++  }
++
+   async handleFileChunk(client, msg) {
+     if (!client.authed) return;
+     const { transfer_id, data } = msg.data;
+@@ -306,9 +359,10 @@ class Server {
+   async handleFileEnd(client, msg) {
+     if (!client.authed) return;
+     const { transfer_id, checksum } = msg.data;
+-    const transfer = this.transfers.get(transfer_id);
++    const transfer = this.transfers.get(transfer_id) || client.activeTransfer;
++
+     if (transfer) {
+-      // Wait for the write stream to fully flush before reporting done
++      // Wait for the write stream to fully flush
+       await new Promise((resolve, reject) => {
+         transfer.stream.end((err) => {
+           if (err) reject(err);
+@@ -319,16 +373,32 @@ class Server {
+       const actualChecksum = transfer.hash.digest("hex");
+ 
+       if (checksum && checksum !== actualChecksum) {
+-        console.warn(
+-          `[File] WARNING: Checksum mismatch for ${transfer.filename}`,
++        this.logger.warn(
++          `[File] WARNING: Checksum mismatch for ${transfer.filename}. Expected ${checksum}, got ${actualChecksum}`,
+         );
+       }
+ 
+-      this.transfers.delete(transfer_id);
+       const elapsed = Date.now() - transfer.start_time;
+-      console.log(
+-        `[File] Received: ${transfer.filename} (${transfer.received} chunks in ${elapsed}ms)`,
++      this.logger.info(
++        `[File] Received: ${transfer.filename} (${transfer.totalBytes || 0} bytes in ${transfer.received} chunks, ${elapsed}ms)`,
++      );
++      this.logger.info(
++        `[File] 📂 Saved to: ${this.cfg.receive_dir}/${transfer.filename}`,
+       );
++
++      // Verify file size if we have an expected size
++      if (
++        transfer.expectedSize &&
++        transfer.totalBytes !== transfer.expectedSize
++      ) {
++        this.logger.warn(
++          `[File] Size mismatch: ${transfer.totalBytes} received vs ${transfer.expectedSize} expected`,
++        );
++      }
++
++      this.transfers.delete(transfer.transferId);
++      client.activeTransfer = null;
++
+       this.sendMessage(
+         client,
+         new Message(MessageTypes.ACK, { message_id: msg.id, status: "ok" }),
+@@ -344,7 +414,7 @@ class Server {
+         if (this.pairingActive) {
+           this.pairingActive = false;
+           this.pairingCode = null;
+-          console.log(`[Server] Pairing code expired`);
++          this.logger.info(`[Server] Pairing code expired`);
+         }
+       },
+       5 * 60 * 1000,
+@@ -358,6 +428,12 @@ class Server {
+     }
+   }
+ 
++  sendBinary(client, data) {
++    if (client.ws.readyState === WebSocket.OPEN) {
++      client.ws.send(data);
++    }
++  }
++
+   async sendText(deviceID, text) {
+     const client = deviceID
+       ? this.clients.get(deviceID)
+@@ -385,43 +461,58 @@ class Server {
+ 
+     const stats = await fs.stat(filePath);
+     const transferID = Store.generateDeviceID();
+-    const chunkSize = 60 * 1024; // 60KB (multiple of 3)
++    const chunkSize = 64 * 1024; // 64KB
+ 
++    // Step 1: Send FILE_META (JSON)
++    this.logger.info(
++      `[File] >>> Sending FILE_META: name=${path.basename(filePath)}, size=${stats.size}, transfer_id=${transferID}`,
++    );
+     this.sendMessage(
+       client,
+-      new Message(MessageTypes.FILE_START, {
+-        filename: path.basename(filePath),
+-        file_size: stats.size,
+-        chunk_size: chunkSize,
++      new Message(MessageTypes.FILE_META, {
++        name: path.basename(filePath),
++        size: stats.size,
+         transfer_id: transferID,
+       }),
+     );
+ 
++    // Give the mobile a moment to process FILE_META and set up the receive
++    await new Promise((r) => setTimeout(r, 200));
++
+     const buffer = Buffer.alloc(chunkSize);
+     const fd = await fs.open(filePath, "r");
+     let bytesRead;
+     let index = 0;
+     const hash = crypto.createHash("sha256");
+ 
++    this.logger.info(
++      `[File] Sending binary: ${path.basename(filePath)} (${stats.size} bytes)`,
++    );
++
+     while (
+       (bytesRead = (await fs.read(fd, buffer, 0, chunkSize, null)).bytesRead) >
+       0
+     ) {
+       const data = buffer.slice(0, bytesRead);
+       hash.update(data);
+-      this.sendMessage(
+-        client,
+-        new Message(MessageTypes.FILE_CHUNK, {
+-          transfer_id: transferID,
+-          index: index++,
+-          data: data.toString("base64"),
+-          size: bytesRead,
+-        }),
+-      );
+-      await new Promise((r) => setTimeout(r, 5));
++
++      // Step 2 & 3: Send binary frames
++      this.sendBinary(client, data);
++      index++;
++
++      if (index <= 3 || index % 50 === 0) {
++        this.logger.info(`[File] Sent chunk #${index} (${bytesRead} bytes)`);
++      }
++
++      // Small delay to prevent flooding (increased from 2ms to 10ms)
++      await new Promise((r) => setTimeout(r, 10));
+     }
+     await fs.close(fd);
+ 
++    // Step 5: Send FILE_END (JSON)
++    this.logger.info(
++      `[File] >>> Sending FILE_END: transfer_id=${transferID}, total_chunks=${index}`,
++    );
+     this.sendMessage(
+       client,
+       new Message(MessageTypes.FILE_END, {
+@@ -431,8 +522,8 @@ class Server {
+       }),
+     );
+ 
+-    console.log(
+-      `[File] Sent: ${path.basename(filePath)} (${index} chunks, ${stats.size} bytes)`,
++    this.logger.info(
++      `[File] Sent: ${path.basename(filePath)} (${index} chunks, ${stats.size} bytes) ✓`,
+     );
+   }
+ 
+diff --git a/pc/cmd/main.go b/pc/cmd/main.go
+index 6568fe6..03b5694 100644
+--- a/pc/cmd/main.go
++++ b/pc/cmd/main.go
+@@ -3,11 +3,13 @@ package main
+ import (
+ 	"bufio"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"os"
+ 	"os/signal"
+ 	"path/filepath"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 
+ 	"mcsync/internal/clipboard"
+@@ -26,7 +28,7 @@ const banner = `
+  | | | | | | (__\__ \ |_| | | | | (__ 
+  |_| |_| |_|\___|___/\__, |_| |_|\___|
+                        |___/            
+-  Terminal-Driven Phone ↔ PC Sync
++  Terminal-Driven Phone ↔ PC Sync (Go)
+   v%s
+ `
+ 
+@@ -35,8 +37,29 @@ var (
+ 	srv         *server.Server
+ 	cfg         *config.Config
+ 	deviceStore *store.Store
++	consoleMu   sync.Mutex
+ )
+ 
++// safeWriter ensures that background logs don't overwrite the REPL prompt
++type safeWriter struct {
++	out io.Writer
++}
++
++func (w safeWriter) Write(p []byte) (n int, err error) {
++	consoleMu.Lock()
++	defer consoleMu.Unlock()
++
++	// Clear current line (where prompt might be)
++	fmt.Fprint(w.out, "\r\033[K")
++
++	// Write the log message
++	n, err = w.out.Write(p)
++
++	// Redraw prompt if it's supposed to be there
++	fmt.Fprint(w.out, "mcSync> ")
++	return
++}
++
+ func main() {
+ 	fmt.Printf(banner, version)
+ 
+@@ -89,9 +112,10 @@ func main() {
+ 		os.Exit(0)
+ 	}()
+ 
+-	// Suppress default log prefix clutter while in REPL
++	// Setup safe logging for REPL
+ 	log.SetFlags(0)
+ 	log.SetPrefix("  [log] ")
++	log.SetOutput(safeWriter{out: os.Stdout})
+ 
+ 	// Start the interactive REPL
+ 	repl()
+@@ -101,7 +125,9 @@ func repl() {
+ 	scanner := bufio.NewScanner(os.Stdin)
+ 
+ 	for {
++		// No need to Lock here as Scan() is blocking and we want the prompt to appear initially
+ 		fmt.Print("mcSync> ")
++
+ 		if !scanner.Scan() {
+ 			break // EOF or error
+ 		}
+@@ -293,7 +319,7 @@ func cmdStatus() {
+ 	localIP := discovery.GetLocalIP()
+ 	devs := srv.GetConnectedDevices()
+ 	fmt.Println()
+-	fmt.Println("  mcSync Status")
++	fmt.Println("  mcSync Status (Go)")
+ 	fmt.Println("  ─────────────────────────────")
+ 	fmt.Printf("  Device:     %s\n", cfg.DeviceName)
+ 	fmt.Printf("  Local IP:   %s\n", localIP)
+diff --git a/pc/internal/config/config.go b/pc/internal/config/config.go
+index 626ae02..0245f99 100644
+--- a/pc/internal/config/config.go
++++ b/pc/internal/config/config.go
+@@ -11,9 +11,9 @@ const (
+ 	AppName        = "mcsync"
+ 	DefaultPort    = 9090
+ 	ServiceType    = "_mcsync._tcp"
+-	ChunkSize      = 64 * 1024   // 64KB chunks for file transfer
+-	PingInterval   = 15          // seconds
+-	MaxMessageSize = 1024 * 1024 // 1MB max WebSocket frame
++	ChunkSize      = 64 * 1024        // 64KB chunks for file transfer
++	PingInterval   = 15               // seconds
++	MaxMessageSize = 10 * 1024 * 1024 // 10MB max WebSocket frame
+ )
+ 
+ // Config holds the application configuration
+diff --git a/pc/internal/protocol/messages.go b/pc/internal/protocol/messages.go
+index 2647e1a..c3787c8 100644
+--- a/pc/internal/protocol/messages.go
++++ b/pc/internal/protocol/messages.go
+@@ -12,6 +12,7 @@ const (
+ 	TypeAuthResp  = "AUTH_RESP"
+ 	TypeText      = "TEXT"
+ 	TypeFileStart = "FILE_START"
++	TypeFileMeta  = "FILE_META"
+ 	TypeFileChunk = "FILE_CHUNK"
+ 	TypeFileEnd   = "FILE_END"
+ 	TypeClipboard = "CLIPBOARD"
+@@ -101,7 +102,7 @@ type FileStartPayload struct {
+ 	TransferID string `json:"transfer_id"`
+ }
+ 
+-// FileChunkPayload carries a chunk of file data (base64 encoded)
++// FileChunkPayload carries a chunk of file data (base64 encoded - LEGACY)
+ type FileChunkPayload struct {
+ 	TransferID string `json:"transfer_id"`
+ 	Index      int    `json:"index"`
+@@ -109,6 +110,13 @@ type FileChunkPayload struct {
+ 	Size       int    `json:"size"`
+ }
+ 
++// FileMetaPayload signals the beginning of a file transfer (MODERN)
++type FileMetaPayload struct {
++	Name       string `json:"name"`
++	Size       int64  `json:"size"`
++	TransferID string `json:"transfer_id"`
++}
++
+ // FileEndPayload signals the end of a file transfer
+ type FileEndPayload struct {
+ 	TransferID  string `json:"transfer_id"`
+diff --git a/pc/internal/server/server.go b/pc/internal/server/server.go
+index d99de16..0937e30 100644
+--- a/pc/internal/server/server.go
++++ b/pc/internal/server/server.go
+@@ -6,6 +6,7 @@ import (
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
++	"hash"
+ 	"io"
+ 	"log"
+ 	"net"
+@@ -53,6 +54,9 @@ type Client struct {
+ 	Conn       *websocket.Conn
+ 	Authed     bool
+ 	mu         sync.Mutex
++
++	// Current binary transfer for this connection
++	ActiveTransfer *FileTransfer
+ }
+ 
+ // FileTransfer tracks an ongoing file transfer
+@@ -63,8 +67,9 @@ type FileTransfer struct {
+ 	ChunkSize   int
+ 	Received    int
+ 	TotalChunks int
++	TotalBytes  int64
+ 	File        *os.File
+-	Hash        []byte
++	Hasher      hash.Hash
+ 	StartTime   time.Time
+ }
+ 
+@@ -112,15 +117,12 @@ func (s *Server) Start() error {
+ 		// Non-fatal, continue without mDNS
+ 	}
+ 
+-	// Automatic clipboard monitor has been explicitly disabled. Must sync manually via triggers.
+-	// We no longer automatically call s.clipMonitor.Start() here.
+-
+ 	// HTTP routes
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/ws", s.handleWebSocket)
+ 	mux.HandleFunc("/health", s.handleHealth)
+ 	mux.HandleFunc("/info", s.handleInfo)
+-	mux.HandleFunc("/pair-http", s.handlePairHTTP) // NEW: HTTP pairing endpoint
++	mux.HandleFunc("/pair-http", s.handlePairHTTP)
+ 
+ 	s.httpServer = &http.Server{
+ 		Addr:    fmt.Sprintf(":%d", s.cfg.Port),
+@@ -130,17 +132,13 @@ func (s *Server) Start() error {
+ 	// Start serving
+ 	go func() {
+ 		localIP := discovery.GetLocalIP()
+-
+-		// Attempt to create a listener first to catch "address already in use" errors synchronously
+-		// Use 0.0.0.0 to force IPv4 for better compatibility with phone hotspots
+ 		addr := fmt.Sprintf("0.0.0.0:%d", s.cfg.Port)
+ 		ln, err := net.Listen("tcp", addr)
+ 		if err != nil {
+-			log.Fatalf("\n  ✗ FATAL: Failed to start server: %v\n  Something else is already using port %d. Use 'lsof -i :%d' to find it.\n", err, s.cfg.Port, s.cfg.Port)
++			log.Fatalf("\n  ✗ FATAL: Failed to start server: %v\n", err)
+ 		}
+ 
+ 		log.Printf("[Server] Listening on 0.0.0.0:%d (Accessible at %s:%d)", s.cfg.Port, localIP, s.cfg.Port)
+-		log.Printf("[Server] WebSocket endpoint: ws://%s:%d/ws", localIP, s.cfg.Port)
+ 
+ 		if err := s.httpServer.Serve(ln); err != http.ErrServerClosed {
+ 			log.Fatalf("[Server] HTTP server error: %v", err)
+@@ -163,7 +161,6 @@ func (s *Server) Stop() {
+ 	}
+ 	s.clipMonitor.Stop()
+ 
+-	// Close all client connections
+ 	s.mu.Lock()
+ 	for _, c := range s.clients {
+ 		c.Conn.Close()
+@@ -190,7 +187,6 @@ func (s *Server) StartPairing() (string, error) {
+ 	s.pairingActive = true
+ 	s.mu.Unlock()
+ 
+-	// Auto-expire pairing after 5 minutes
+ 	go func() {
+ 		time.Sleep(5 * time.Minute)
+ 		s.mu.Lock()
+@@ -205,7 +201,6 @@ func (s *Server) StartPairing() (string, error) {
+ 	return code, nil
+ }
+ 
+-// handleWebSocket handles new WebSocket connections
+ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+ 	conn, err := s.upgrader.Upgrade(w, r, nil)
+ 	if err != nil {
+@@ -216,17 +211,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+ 	remoteAddr := r.RemoteAddr
+ 	log.Printf("[Server] New connection from %s", remoteAddr)
+ 
+-	// Create an unauthenticated client
+ 	client := &Client{
+ 		Conn:   conn,
+ 		Authed: false,
+ 	}
+ 
+-	// Handle the connection
+ 	go s.handleClient(client, remoteAddr)
+ }
+ 
+-// handleClient manages the lifecycle of a single client connection
+ func (s *Server) handleClient(client *Client, remoteAddr string) {
+ 	defer func() {
+ 		client.Conn.Close()
+@@ -238,11 +230,10 @@ func (s *Server) handleClient(client *Client, remoteAddr string) {
+ 		}
+ 	}()
+ 
+-	// Set read limits
+ 	client.Conn.SetReadLimit(int64(config.MaxMessageSize))
+ 
+ 	for {
+-		_, rawMsg, err := client.Conn.ReadMessage()
++		messageType, rawMsg, err := client.Conn.ReadMessage()
+ 		if err != nil {
+ 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+ 				log.Printf("[Server] Read error from %s: %v", remoteAddr, err)
+@@ -250,13 +241,17 @@ func (s *Server) handleClient(client *Client, remoteAddr string) {
+ 			return
+ 		}
+ 
++		if messageType == websocket.BinaryMessage {
++			s.handleBinaryChunk(client, rawMsg)
++			continue
++		}
++
+ 		msg, err := protocol.DecodeMessage(rawMsg)
+ 		if err != nil {
+ 			log.Printf("[Server] Decode error: %v", err)
+ 			continue
+ 		}
+ 
+-		// Route message
+ 		switch msg.Type {
+ 		case protocol.TypeAuth:
+ 			s.handleAuth(client, msg, remoteAddr)
+@@ -268,6 +263,8 @@ func (s *Server) handleClient(client *Client, remoteAddr string) {
+ 			s.handleClipboard(client, msg)
+ 		case protocol.TypeFileStart:
+ 			s.handleFileStart(client, msg)
++		case protocol.TypeFileMeta:
++			s.handleFileMeta(client, msg)
+ 		case protocol.TypeFileChunk:
+ 			s.handleFileChunk(client, msg)
+ 		case protocol.TypeFileEnd:
+@@ -276,14 +273,12 @@ func (s *Server) handleClient(client *Client, remoteAddr string) {
+ 			resp, _ := protocol.NewMessage(protocol.TypePong, nil)
+ 			s.sendMessage(client, resp)
+ 		case protocol.TypePong:
+-			// keepalive response, no action needed
+ 		default:
+ 			log.Printf("[Server] Unknown message type: %s", msg.Type)
+ 		}
+ 	}
+ }
+ 
+-// handleAuth processes authentication from a paired device
+ func (s *Server) handleAuth(client *Client, msg *protocol.Message, remoteAddr string) {
+ 	var payload protocol.AuthPayload
+ 	if err := msg.ParseData(&payload); err != nil {
+@@ -300,7 +295,6 @@ func (s *Server) handleAuth(client *Client, msg *protocol.Message, remoteAddr st
+ 		return
+ 	}
+ 
+-	// Authentication successful
+ 	client.DeviceID = payload.DeviceID
+ 	client.DeviceName = payload.DeviceName
+ 	client.Authed = true
+@@ -309,7 +303,6 @@ func (s *Server) handleAuth(client *Client, msg *protocol.Message, remoteAddr st
+ 	s.clients[payload.DeviceID] = client
+ 	s.mu.Unlock()
+ 
+-	// Update last seen
+ 	s.store.UpdateLastSeen(payload.DeviceID, remoteAddr, s.cfg.Port)
+ 
+ 	resp, _ := protocol.NewMessage(protocol.TypeAuthResp, protocol.AuthRespPayload{
+@@ -322,7 +315,6 @@ func (s *Server) handleAuth(client *Client, msg *protocol.Message, remoteAddr st
+ 	log.Printf("[Server] Device authenticated: %s (%s)", payload.DeviceName, payload.DeviceID[:8])
+ }
+ 
+-// handlePairRequest processes a new device pairing request
+ func (s *Server) handlePairRequest(client *Client, msg *protocol.Message, remoteAddr string) {
+ 	var payload protocol.PairReqPayload
+ 	if err := msg.ParseData(&payload); err != nil {
+@@ -344,14 +336,12 @@ func (s *Server) handlePairRequest(client *Client, msg *protocol.Message, remote
+ 		return
+ 	}
+ 
+-	// Generate auth token
+ 	authToken, err := store.GenerateAuthToken()
+ 	if err != nil {
+ 		s.sendError(client, "Internal error generating auth token")
+ 		return
+ 	}
+ 
+-	// Store the paired device
+ 	device := &store.PairedDevice{
+ 		DeviceID:   payload.DeviceID,
+ 		DeviceName: payload.DeviceName,
+@@ -366,13 +356,11 @@ func (s *Server) handlePairRequest(client *Client, msg *protocol.Message, remote
+ 		return
+ 	}
+ 
+-	// Disable pairing mode
+ 	s.mu.Lock()
+ 	s.pairingActive = false
+ 	s.pairingCode = ""
+ 	s.mu.Unlock()
+ 
+-	// Mark client as authenticated
+ 	client.DeviceID = payload.DeviceID
+ 	client.DeviceName = payload.DeviceName
+ 	client.Authed = true
+@@ -393,7 +381,6 @@ func (s *Server) handlePairRequest(client *Client, msg *protocol.Message, remote
+ 	log.Printf("[Server] Device paired: %s (%s)", payload.DeviceName, payload.DeviceID[:8])
+ }
+ 
+-// handlePairHTTP allows pairing via a standard POST request (bypass hotspot WS blocks)
+ func (s *Server) handlePairHTTP(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodPost {
+ 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+@@ -449,7 +436,6 @@ func (s *Server) handlePairHTTP(w http.ResponseWriter, r *http.Request) {
+ 	log.Printf("[Server] Device paired via HTTP: %s (%s)", payload.DeviceName, payload.DeviceID[:8])
+ }
+ 
+-// handleText processes incoming text from a phone
+ func (s *Server) handleText(client *Client, msg *protocol.Message) {
+ 	if !client.Authed {
+ 		s.sendError(client, "Not authenticated")
+@@ -464,7 +450,6 @@ func (s *Server) handleText(client *Client, msg *protocol.Message) {
+ 
+ 	log.Printf("[Text] From %s: %s", client.DeviceName, payload.Content)
+ 
+-	// Send ack
+ 	ack, _ := protocol.NewMessage(protocol.TypeAck, protocol.AckPayload{
+ 		MessageID: msg.ID,
+ 		Status:    "ok",
+@@ -472,7 +457,6 @@ func (s *Server) handleText(client *Client, msg *protocol.Message) {
+ 	s.sendMessage(client, ack)
+ }
+ 
+-// handleClipboard processes clipboard sync from phone
+ func (s *Server) handleClipboard(client *Client, msg *protocol.Message) {
+ 	if !client.Authed {
+ 		s.sendError(client, "Not authenticated")
+@@ -485,7 +469,6 @@ func (s *Server) handleClipboard(client *Client, msg *protocol.Message) {
+ 		return
+ 	}
+ 
+-	// Set clipboard locally
+ 	s.clipMonitor.SetContent(payload.Content)
+ 	if err := clipboard.Write(payload.Content); err != nil {
+ 		log.Printf("[Clipboard] Failed to write: %v", err)
+@@ -495,7 +478,6 @@ func (s *Server) handleClipboard(client *Client, msg *protocol.Message) {
+ 	log.Printf("[Clipboard] Synced from %s: %s", client.DeviceName, truncate(payload.Content, 50))
+ }
+ 
+-// handleFileStart begins receiving a file from a phone
+ func (s *Server) handleFileStart(client *Client, msg *protocol.Message) {
+ 	if !client.Authed {
+ 		s.sendError(client, "Not authenticated")
+@@ -508,10 +490,7 @@ func (s *Server) handleFileStart(client *Client, msg *protocol.Message) {
+ 		return
+ 	}
+ 
+-	// Create receive file
+ 	destPath := filepath.Join(s.cfg.ReceiveDir, payload.Filename)
+-
+-	// Ensure unique filename
+ 	destPath = ensureUniquePath(destPath)
+ 
+ 	f, err := os.Create(destPath)
+@@ -521,14 +500,17 @@ func (s *Server) handleFileStart(client *Client, msg *protocol.Message) {
+ 	}
+ 
+ 	s.transfersMu.Lock()
+-	s.transfers[payload.TransferID] = &FileTransfer{
++	transfer := &FileTransfer{
+ 		TransferID: payload.TransferID,
+ 		Filename:   filepath.Base(destPath),
+ 		FileSize:   payload.FileSize,
+ 		ChunkSize:  payload.ChunkSize,
+ 		File:       f,
++		Hasher:     sha256.New(),
+ 		StartTime:  time.Now(),
+ 	}
++	s.transfers[payload.TransferID] = transfer
++	client.ActiveTransfer = transfer
+ 	s.transfersMu.Unlock()
+ 
+ 	log.Printf("[File] Starting receive: %s (%d bytes)", payload.Filename, payload.FileSize)
+@@ -540,7 +522,67 @@ func (s *Server) handleFileStart(client *Client, msg *protocol.Message) {
+ 	s.sendMessage(client, ack)
+ }
+ 
+-// handleFileChunk processes a chunk of incoming file data
++func (s *Server) handleFileMeta(client *Client, msg *protocol.Message) {
++	if !client.Authed {
++		s.sendError(client, "Not authenticated")
++		return
++	}
++
++	var payload protocol.FileMetaPayload
++	if err := msg.ParseData(&payload); err != nil {
++		s.sendError(client, "Invalid file meta payload")
++		return
++	}
++
++	destPath := filepath.Join(s.cfg.ReceiveDir, payload.Name)
++	destPath = ensureUniquePath(destPath)
++
++	f, err := os.Create(destPath)
++	if err != nil {
++		s.sendError(client, fmt.Sprintf("Failed to create file: %v", err))
++		return
++	}
++
++	s.transfersMu.Lock()
++	transfer := &FileTransfer{
++		TransferID: payload.TransferID,
++		Filename:   filepath.Base(destPath),
++		FileSize:   payload.Size,
++		File:       f,
++		Hasher:     sha256.New(),
++		StartTime:  time.Now(),
++	}
++	if payload.TransferID != "" {
++		s.transfers[payload.TransferID] = transfer
++	}
++	client.ActiveTransfer = transfer
++	s.transfersMu.Unlock()
++
++	log.Printf("[File] Starting binary receive: %s (%d bytes)", payload.Name, payload.Size)
++
++	ack, _ := protocol.NewMessage(protocol.TypeAck, protocol.AckPayload{
++		MessageID: msg.ID,
++		Status:    "ok",
++	})
++	s.sendMessage(client, ack)
++}
++
++func (s *Server) handleBinaryChunk(client *Client, data []byte) {
++	if !client.Authed || client.ActiveTransfer == nil {
++		return
++	}
++
++	transfer := client.ActiveTransfer
++	if _, err := transfer.File.Write(data); err != nil {
++		log.Printf("[File] Write error: %v", err)
++		return
++	}
++
++	transfer.Hasher.Write(data)
++	transfer.Received++
++	transfer.TotalBytes += int64(len(data))
++}
++
+ func (s *Server) handleFileChunk(client *Client, msg *protocol.Message) {
+ 	if !client.Authed {
+ 		return
+@@ -570,10 +612,10 @@ func (s *Server) handleFileChunk(client *Client, msg *protocol.Message) {
+ 		return
+ 	}
+ 
++	transfer.Hasher.Write(data)
+ 	transfer.Received++
+ }
+ 
+-// handleFileEnd completes a file transfer
+ func (s *Server) handleFileEnd(client *Client, msg *protocol.Message) {
+ 	if !client.Authed {
+ 		return
+@@ -586,25 +628,33 @@ func (s *Server) handleFileEnd(client *Client, msg *protocol.Message) {
+ 
+ 	s.transfersMu.Lock()
+ 	transfer, ok := s.transfers[payload.TransferID]
+-	if ok {
+-		delete(s.transfers, payload.TransferID)
++	if !ok {
++		transfer = client.ActiveTransfer
++	}
++
++	if transfer != nil {
++		delete(s.transfers, transfer.TransferID)
++		client.ActiveTransfer = nil
+ 	}
+ 	s.transfersMu.Unlock()
+ 
+-	if !ok {
++	if transfer == nil {
+ 		return
+ 	}
+ 
+ 	transfer.File.Close()
+ 
+ 	elapsed := time.Since(transfer.StartTime)
+-	log.Printf("[File] Received: %s (%d chunks in %v)", transfer.Filename, transfer.Received, elapsed.Round(time.Millisecond))
++	log.Printf("[File] Received: %s (%d bytes in %d chunks, %v)", transfer.Filename, transfer.TotalBytes, transfer.Received, elapsed.Round(time.Millisecond))
++
++	if transfer.FileSize > 0 && transfer.TotalBytes != transfer.FileSize {
++		log.Printf("[File] WARNING: Size mismatch: %d received vs %d expected", transfer.TotalBytes, transfer.FileSize)
++	}
+ 
+-	// Verify checksum if provided
+ 	if payload.Checksum != "" {
+-		destPath := filepath.Join(s.cfg.ReceiveDir, transfer.Filename)
+-		if ok := verifyChecksum(destPath, payload.Checksum); !ok {
+-			log.Printf("[File] WARNING: Checksum mismatch for %s", transfer.Filename)
++		actualChecksum := fmt.Sprintf("%x", transfer.Hasher.Sum(nil))
++		if actualChecksum != payload.Checksum {
++			log.Printf("[File] WARNING: Checksum mismatch for %s. Expected %s, got %s", transfer.Filename, payload.Checksum, actualChecksum)
+ 		}
+ 	}
+ 
+@@ -615,7 +665,6 @@ func (s *Server) handleFileEnd(client *Client, msg *protocol.Message) {
+ 	s.sendMessage(client, ack)
+ }
+ 
+-// SendText sends a text message to a connected device
+ func (s *Server) SendText(deviceID, text string) error {
+ 	client, err := s.getClient(deviceID)
+ 	if err != nil {
+@@ -628,7 +677,6 @@ func (s *Server) SendText(deviceID, text string) error {
+ 	return s.sendMessage(client, msg)
+ }
+ 
+-// SendClipboard sends clipboard content to a connected device
+ func (s *Server) SendClipboard(deviceID, content string) error {
+ 	client, err := s.getClient(deviceID)
+ 	if err != nil {
+@@ -642,14 +690,12 @@ func (s *Server) SendClipboard(deviceID, content string) error {
+ 	return s.sendMessage(client, msg)
+ }
+ 
+-// SendFile sends a file to a connected device
+ func (s *Server) SendFile(deviceID, filePath string) error {
+ 	client, err := s.getClient(deviceID)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	// Open file
+ 	f, err := os.Open(filePath)
+ 	if err != nil {
+ 		return fmt.Errorf("open file: %w", err)
+@@ -663,18 +709,15 @@ func (s *Server) SendFile(deviceID, filePath string) error {
+ 
+ 	transferID, _ := store.GenerateDeviceID()
+ 
+-	// Send FILE_START
+-	startMsg, _ := protocol.NewMessage(protocol.TypeFileStart, protocol.FileStartPayload{
+-		Filename:   stat.Name(),
+-		FileSize:   stat.Size(),
+-		ChunkSize:  config.ChunkSize,
++	metaMsg, _ := protocol.NewMessage(protocol.TypeFileMeta, protocol.FileMetaPayload{
++		Name:       stat.Name(),
++		Size:       stat.Size(),
+ 		TransferID: transferID,
+ 	})
+-	if err := s.sendMessage(client, startMsg); err != nil {
+-		return fmt.Errorf("send file start: %w", err)
++	if err := s.sendMessage(client, metaMsg); err != nil {
++		return fmt.Errorf("send file meta: %w", err)
+ 	}
+ 
+-	// Stream chunks
+ 	buf := make([]byte, config.ChunkSize)
+ 	chunkIndex := 0
+ 	hasher := sha256.New()
+@@ -685,19 +728,15 @@ func (s *Server) SendFile(deviceID, filePath string) error {
+ 			data := buf[:n]
+ 			hasher.Write(data)
+ 
+-			chunkMsg, _ := protocol.NewMessage(protocol.TypeFileChunk, protocol.FileChunkPayload{
+-				TransferID: transferID,
+-				Index:      chunkIndex,
+-				Data:       base64.StdEncoding.EncodeToString(data),
+-				Size:       n,
+-			})
+-			if err := s.sendMessage(client, chunkMsg); err != nil {
+-				return fmt.Errorf("send chunk %d: %w", chunkIndex, err)
++			client.mu.Lock()
++			err = client.Conn.WriteMessage(websocket.BinaryMessage, data)
++			client.mu.Unlock()
++			if err != nil {
++				return fmt.Errorf("send binary chunk %d: %w", chunkIndex, err)
+ 			}
+ 			chunkIndex++
+ 
+-			// Small delay to prevent overwhelming the connection
+-			time.Sleep(5 * time.Millisecond)
++			time.Sleep(2 * time.Millisecond)
+ 		}
+ 		if err == io.EOF {
+ 			break
+@@ -707,7 +746,6 @@ func (s *Server) SendFile(deviceID, filePath string) error {
+ 		}
+ 	}
+ 
+-	// Send FILE_END
+ 	checksum := fmt.Sprintf("%x", hasher.Sum(nil))
+ 	endMsg, _ := protocol.NewMessage(protocol.TypeFileEnd, protocol.FileEndPayload{
+ 		TransferID:  transferID,
+@@ -718,11 +756,10 @@ func (s *Server) SendFile(deviceID, filePath string) error {
+ 		return fmt.Errorf("send file end: %w", err)
+ 	}
+ 
+-	log.Printf("[File] Sent: %s (%d chunks, %d bytes)", stat.Name(), chunkIndex, stat.Size())
++	log.Printf("[File] Sent binary: %s (%d chunks, %d bytes)", stat.Name(), chunkIndex, stat.Size())
+ 	return nil
+ }
+ 
+-// broadcastClipboard sends clipboard content to all connected devices
+ func (s *Server) broadcastClipboard(content string) {
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+@@ -739,7 +776,6 @@ func (s *Server) broadcastClipboard(content string) {
+ 	}
+ }
+ 
+-// GetConnectedDevices returns the list of connected device IDs
+ func (s *Server) GetConnectedDevices() []string {
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+@@ -752,7 +788,6 @@ func (s *Server) GetConnectedDevices() []string {
+ 	return ids
+ }
+ 
+-// pingLoop sends periodic pings to all connected clients
+ func (s *Server) pingLoop() {
+ 	ticker := time.NewTicker(time.Duration(config.PingInterval) * time.Second)
+ 	defer ticker.Stop()
+@@ -774,7 +809,6 @@ func (s *Server) pingLoop() {
+ 	}
+ }
+ 
+-// sendMessage sends a message to a client (thread-safe)
+ func (s *Server) sendMessage(client *Client, msg *protocol.Message) error {
+ 	data, err := msg.Encode()
+ 	if err != nil {
+@@ -785,7 +819,6 @@ func (s *Server) sendMessage(client *Client, msg *protocol.Message) error {
+ 	return client.Conn.WriteMessage(websocket.TextMessage, data)
+ }
+ 
+-// sendError sends an error message to a client
+ func (s *Server) sendError(client *Client, errMsg string) {
+ 	msg, _ := protocol.NewMessage(protocol.TypeError, protocol.ErrorPayload{
+ 		Code:    400,
+@@ -794,12 +827,10 @@ func (s *Server) sendError(client *Client, errMsg string) {
+ 	s.sendMessage(client, msg)
+ }
+ 
+-// getClient returns a connected, authenticated client
+ func (s *Server) getClient(deviceID string) (*Client, error) {
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+ 
+-	// If deviceID is empty, return the first connected device
+ 	if deviceID == "" {
+ 		for _, c := range s.clients {
+ 			if c.Authed {
+@@ -819,25 +850,21 @@ func (s *Server) getClient(deviceID string) (*Client, error) {
+ 	return client, nil
+ }
+ 
+-// handleHealth returns server health status
+ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+ 	w.Header().Set("Content-Type", "application/json")
+ 	w.Write([]byte(`{"status":"ok"}`))
+ }
+ 
+-// handleInfo returns server information
+ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
+ 	s.mu.RLock()
+ 	connectedCount := len(s.clients)
+ 	s.mu.RUnlock()
+ 
+ 	w.Header().Set("Content-Type", "application/json")
+-	fmt.Fprintf(w, `{"name":"%s","id":"%s","port":%d,"connected":%d}`,
++	fmt.Fprintf(w, `{"device_name":"%s","device_id":"%s","version":"1.0.0","port":%d,"connected":%d}`,
+ 		s.cfg.DeviceName, s.cfg.DeviceID, s.cfg.Port, connectedCount)
+ }
+ 
+-// --- Utilities ---
+-
+ func truncate(s string, maxLen int) string {
+ 	if len(s) <= maxLen {
+ 		return s

@@ -5,9 +5,9 @@ const fs = require("fs-extra");
 const AppName = "mcsync";
 const DefaultPort = 9090;
 const ServiceType = "_mcsync._tcp";
-const ChunkSize = 60 * 1024; // 60KB (multiple of 3 for base64 safety)
+const ChunkSize = 64 * 1024; // 64KB chunks for file transfer
 const PingInterval = 15; // seconds
-const MaxMessageSize = 10 * 1024 * 1024; // 10MB (raised for better handling)
+const MaxMessageSize = 10 * 1024 * 1024; // 10MB max WebSocket frame
 
 class Config {
   constructor() {
@@ -19,6 +19,7 @@ class Config {
     this.data_dir = path.join(homeDir, ".mcsync");
     this.receive_dir = path.join(this.data_dir, "received");
     this.clipboard_sync = true;
+    this.first_run = true; // true until user completes first-time setup
   }
 
   static async load() {
