@@ -1,8 +1,11 @@
 {
   "name": "pc-node",
   "version": "1.0.0",
-  "description": "",
   "main": "index.js",
+  "bin": {
+    "mcsync": "./src/index.js"
+  },
+  "description": "A command-line tool for synchronizing files across devices using multicast DNS.",
   "scripts": {
     "start": "node src/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
